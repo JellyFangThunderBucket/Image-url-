@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Image Max URL - iPhone Compatibility Mode
 // @namespace    https://littlelooney.example/image-max-url-iphone
-// @version      2026-06-21.2
+// @version      2026-06-21.3
 // @description  iPhone/Safari companion for Image/Video Max URL: menu commands, a touch control center, safe page scanning, optional advanced API checks, HD URL guesses, filtering, sorting, and fullscreen preview.
 // @author       LittleLooney + OpenAI
 // @license      Apache-2.0
@@ -38,8 +38,8 @@
   const MAX_BACKGROUND_SCAN_NODES = 2500;
   const MAX_ADVANCED_HEAD_CHECKS = 30;
   const IMAGE_EXT_RE = /\.(?:avif|bmp|gif|heic|heif|jpe?g|jxl|png|svg|webp)(?:[?#].*)?$/i;
-  const VIDEO_EXT_RE = /\.(?:3g2|3gp|avi|m4v|mkv|mov|mp4|mpeg|mpg|ogv|webm)(?:[?#].*)?$/i;
-  const MEDIA_EXT_RE = /\.(?:3g2|3gp|avi|avif|bmp|gif|heic|heif|jpe?g|jxl|m4v|mkv|mov|mp4|mpeg|mpg|ogv|png|svg|webm|webp)(?:[?#].*)?$/i;
+  const VIDEO_EXT_RE = /\.(?:3g2|3gp|avi|m3u8|mpd|m4v|mkv|mov|mp4|mpeg|mpg|ogv|webm)(?:[?#].*)?$/i;
+  const MEDIA_EXT_RE = /\.(?:3g2|3gp|avi|avif|bmp|gif|heic|heif|jpe?g|jxl|m3u8|mpd|m4v|mkv|mov|mp4|mpeg|mpg|ogv|png|svg|webm|webp)(?:[?#].*)?$/i;
   const SIZE_HINT_RE = /(?:^|[?&_/.-])(?:w|width|h|height|size|s|dpr|quality|q)[=:_-]?(\d{2,5})/ig;
   const STRIP_QUERY_PARAMS = new Set(['w', 'width', 'h', 'height', 'fit', 'crop', 'resize', 'quality', 'q']);
   const SAFE_MODE = 'Safe iPhone Mode';
@@ -82,12 +82,19 @@
   let dragState = null;
   let previewTouchStart = null;
   let lastScanAt = 0;
+  let mediaObserver = null;
+  const seenNetworkMedia = new Set();
+  const capturedObjectUrls = new Map();
+  const watchedVideos = new WeakSet();
 
   // ---------- Bootstrap and menu commands ----------
   injectStyles();
   createActionBar();
   createFloatingButton(true);
   registerMenuCommands();
+  installDynamicMediaWatchers();
+  installNetworkMediaWatcher();
+  patchCreateObjectURLForMediaSources();
   if (isTouchDevice) installTouchHandlers();
 
   function detectApis() {
@@ -111,6 +118,158 @@
     safeRegisterMenuCommand('Open top media', () => openTopImage());
     safeRegisterMenuCommand('Toggle floating button', () => toggleFloatingButton());
     safeRegisterMenuCommand('Help / About', () => openHelpAbout());
+  }
+
+
+  // ---------- Dynamic media watchers: click/play, mutations, lazy videos, and object URLs ----------
+  function installDynamicMediaWatchers() {
+    document.addEventListener('click', () => {
+      window.setTimeout(() => debounceScan(false), 1200);
+    }, true);
+
+    document.addEventListener('play', (event) => {
+      if (event.target instanceof HTMLVideoElement) {
+        watchVideoElement(event.target);
+        window.setTimeout(() => debounceScan(true), 500);
+      }
+    }, true);
+
+    document.querySelectorAll('video').forEach((video) => watchVideoElement(video));
+
+    mediaObserver = new MutationObserver((mutations) => {
+      let shouldRescan = false;
+      mutations.forEach((mutation) => {
+        if (mutation.type === 'childList') {
+          mutation.addedNodes.forEach((node) => {
+            if (!(node instanceof Element)) return;
+            if (node instanceof HTMLVideoElement) watchVideoElement(node);
+            node.querySelectorAll?.('video').forEach((video) => watchVideoElement(video));
+            if (node.matches?.('img, picture, source, video, a, [style*="background"]') || node.querySelector?.('img, picture, source, video, a, [style*="background"]')) shouldRescan = true;
+          });
+        }
+        if (mutation.type === 'attributes') {
+          if (mutation.target instanceof HTMLVideoElement) watchVideoElement(mutation.target);
+          shouldRescan = true;
+        }
+      });
+      if (shouldRescan) debounceScan(false);
+    });
+
+    mediaObserver.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['src', 'srcset', 'href', 'style', 'poster', 'data-src', 'data-video', 'data-mp4', 'data-webm', 'data-hd', 'data-full', 'data-fullsrc'],
+    });
+  }
+
+  function watchVideoElement(video) {
+    if (!(video instanceof HTMLVideoElement) || watchedVideos.has(video)) return;
+    watchedVideos.add(video);
+    ['loadedmetadata', 'canplay', 'play', 'sourceopen'].forEach((eventName) => {
+      video.addEventListener(eventName, () => debounceScan(false), { passive: true });
+    });
+    video.querySelectorAll('source').forEach((source) => {
+      ['loadedmetadata', 'canplay', 'play', 'sourceopen'].forEach((eventName) => {
+        source.addEventListener(eventName, () => debounceScan(false), { passive: true });
+      });
+    });
+  }
+
+  function discoverVideoUrls(video, candidates, triggerLoad = false) {
+    if (!(video instanceof HTMLVideoElement)) return [];
+    watchVideoElement(video);
+    if (!video.currentSrc && !video.src) attemptLazyVideoLoad(video);
+
+    const discovered = [];
+    addDiscoveredVideoUrl(discovered, candidates, video.currentSrc, video, 'video currentSrc', 180);
+    addDiscoveredVideoUrl(discovered, candidates, video.src || video.getAttribute('src'), video, 'video src', 170);
+    video.querySelectorAll('source').forEach((source) => {
+      addDiscoveredVideoUrl(discovered, candidates, source.src || source.getAttribute('src'), source, 'video source src', 160);
+      parseSrcset(source.getAttribute('srcset')).forEach((item) => addDiscoveredVideoUrl(discovered, candidates, item.url, source, 'video source srcset', item.score + 140));
+    });
+    collectAttributeValues(video, ['data-video', 'data-mp4', 'data-webm', 'data-hd', 'data-full', 'data-fullsrc', 'data-src']).forEach((url) => {
+      addDiscoveredVideoUrl(discovered, candidates, url, video, 'video data attribute', 145);
+    });
+
+    if (triggerLoad && discovered.some((url) => String(url).startsWith('blob:'))) {
+      showMessage('Blob video detected. Tap play, then scan again for the real source.');
+    }
+    return discovered;
+  }
+
+  function attemptLazyVideoLoad(video) {
+    try { video.load(); } catch (error) { console.debug(`[${PATCH_ID}] video.load() failed`, error); }
+    try {
+      const playResult = video.play();
+      if (playResult && typeof playResult.catch === 'function') playResult.catch(() => {});
+    } catch (error) {
+      console.debug(`[${PATCH_ID}] video.play() blocked`, error);
+    }
+  }
+
+  function addDiscoveredVideoUrl(discovered, candidates, rawUrl, element, source, score) {
+    const url = normalizeUrl(rawUrl);
+    if (!url) return;
+    discovered.push(url);
+    addCandidate(candidates, url, Number(score || 0) + scoreUrl(url), element, source);
+  }
+
+  function installNetworkMediaWatcher() {
+    const originalFetch = window.fetch;
+    if (typeof originalFetch === 'function' && !originalFetch.__imuPatched) {
+      const patchedFetch = function(input, init) {
+        rememberNetworkUrl(typeof input === 'string' ? input : input?.url);
+        return originalFetch.apply(this, arguments);
+      };
+      patchedFetch.__imuPatched = true;
+      window.fetch = patchedFetch;
+    }
+
+    const originalOpen = XMLHttpRequest.prototype.open;
+    if (typeof originalOpen === 'function' && !originalOpen.__imuPatched) {
+      const patchedOpen = function(method, url) {
+        rememberNetworkUrl(url);
+        return originalOpen.apply(this, arguments);
+      };
+      patchedOpen.__imuPatched = true;
+      XMLHttpRequest.prototype.open = patchedOpen;
+    }
+  }
+
+  function rememberNetworkUrl(rawUrl) {
+    const url = normalizeUrl(rawUrl);
+    if (!url || seenNetworkMedia.has(url)) return;
+    if (MEDIA_EXT_RE.test(url) || /m3u8|mpd|mp4|webm|video|image|media/i.test(url)) {
+      seenNetworkMedia.add(url);
+      addCandidate(rawCandidates, url, scoreUrl(url) + 300, null, 'network observed');
+      rawCandidates = chooseLargestCandidates(dedupeByUrl(rawCandidates));
+      pageCandidates = getDisplayCandidates();
+      state.totalFound = rawCandidates.length;
+      state.uniqueFound = dedupeCandidates(rawCandidates).length;
+      refreshDisplayCandidates();
+    }
+  }
+
+  function patchCreateObjectURLForMediaSources() {
+    const nativeCreate = URL.createObjectURL?.bind(URL);
+    if (!nativeCreate || nativeCreate.__imuPatched) return;
+    const patched = (object) => {
+      const url = nativeCreate(object);
+      const isMediaSource = typeof MediaSource !== 'undefined' && object instanceof MediaSource;
+      if (isMediaSource || object instanceof Blob) {
+        capturedObjectUrls.set(url, {
+          score: isMediaSource ? 260 : 180,
+          element: null,
+          source: isMediaSource ? 'MediaSource blob/object URL' : 'Blob object URL',
+        });
+        if (isMediaSource) object.addEventListener('sourceopen', () => debounceScan(false), { once: false });
+        debounceScan(false);
+      }
+      return url;
+    };
+    patched.__imuPatched = true;
+    URL.createObjectURL = patched;
   }
 
   function safeRegisterMenuCommand(label, callback) {
@@ -186,6 +345,8 @@
     ].join(',');
 
     document.querySelectorAll(selector).forEach((element) => collectElementCandidates(element, candidates));
+    document.querySelectorAll('video').forEach((video) => discoverVideoUrls(video, candidates, announce));
+    capturedObjectUrls.forEach((meta, url) => addCandidate(candidates, url, meta.score, meta.element, meta.source));
 
     // Computed background scans are capped to keep Safari responsive on huge pages.
     [...(document.body || document.documentElement).querySelectorAll('*')]
@@ -220,7 +381,7 @@
     for (const item of path || []) {
       if (!(item instanceof Element)) continue;
       if (isMediaCandidate(item)) return item;
-      const nested = item.querySelector?.('img, picture, source[srcset], video, video source[src], [style*="background"]');
+      const nested = item.querySelector?.('video, video source[src], source[src], source[srcset], img, picture, [style*="background"]');
       if (nested && isMediaCandidate(nested)) return nested;
     }
     return null;
@@ -228,7 +389,7 @@
 
   function isMediaCandidate(element) {
     if (!element || !(element instanceof Element)) return false;
-    if (element.matches('img, picture, source[srcset], video, video source[src]')) return true;
+    if (element.matches('video, video source[src], source[src], source[srcset], img, picture')) return true;
     return Boolean(getBackgroundImageUrls(element).length);
   }
 
@@ -263,6 +424,7 @@
       addCandidate(candidates, element.src || element.getAttribute('src'), scoreUrl(element.src || element.getAttribute('src')) + 90, element, 'video source src');
     }
     if (element instanceof HTMLVideoElement) {
+      discoverVideoUrls(element, candidates, false);
       addCandidate(candidates, element.currentSrc, scoreUrl(element.currentSrc) + 140, element, 'video currentSrc');
       addCandidate(candidates, element.src, scoreUrl(element.src) + 130, element, 'video src');
       addCandidate(candidates, element.poster, scoreUrl(element.poster) + 20, element, 'video poster');
@@ -286,7 +448,7 @@
 
   function addCandidate(candidates, rawUrl, score = 0, element = null, source = 'page URL') {
     const url = normalizeUrl(rawUrl);
-    if (!url || url.startsWith('data:') || url.startsWith('blob:')) return;
+    if (!url || url.startsWith('data:')) return;
     const analysis = analyzeCandidate(url, element, source, score);
     if (analysis.reject) return;
     const dimensions = getCandidateDimensions(element, url);
@@ -330,7 +492,8 @@
     const isCategoryPage = isCategoryPageUrl(parsed, path);
 
     if (hasImageExtension) { rules.push('known image extension'); score += 80; confidence = CONFIDENCE.LIKELY_MEDIA; }
-    if (hasVideoExtension) { rules.push('known video extension'); mediaType = 'video'; score += 95; confidence = CONFIDENCE.LIKELY_MEDIA; }
+    if (hasVideoExtension) { rules.push('known video/HLS/DASH extension'); mediaType = /\.(?:m3u8|mpd)(?:[?#]|$)/i.test(url) ? 'video playlist' : 'video'; score += 95; confidence = CONFIDENCE.LIKELY_MEDIA; }
+    if (url.startsWith('blob:')) { rules.push('blob/object media URL'); mediaType = 'video blob/object URL'; score += 120; confidence = CONFIDENCE.LIKELY_MEDIA; }
     if (/\.(?:gif)(?:[?#]|$)/i.test(url)) mediaType = 'gif';
     if (sourceText.includes('poster')) { rules.push('video poster source'); mediaType = 'video poster'; score += 60; confidence = Math.max(confidence, CONFIDENCE.LIKELY_MEDIA); }
     if (sourceText.includes('background')) { rules.push('background media source'); mediaType = 'background media'; score += 45; confidence = Math.max(confidence, CONFIDENCE.LIKELY_MEDIA); }
@@ -367,6 +530,7 @@
       if (confidence < CONFIDENCE.LIKELY_MEDIA && confidence !== CONFIDENCE.POSSIBLE_MEDIA_PAGE) confidence = CONFIDENCE.PAGE_LINK;
     }
 
+    if (url.startsWith('blob:')) return { reject: false, score, confidence, mediaType, rules, reason: 'Blob/Object URL discovered from video or MediaSource. Direct download may not contain the real media segments.' };
     if (score < -20 && confidence <= CONFIDENCE.POSSIBLE_MEDIA) return { reject: true, score, confidence: CONFIDENCE.PAGE_LINK, mediaType: 'page link', rules, reason: 'Rejected low-score page/navigation URL.' };
     return { reject: false, score, confidence, mediaType, rules, reason: rules.join(', ') || 'weak page URL signal' };
   }
@@ -531,12 +695,12 @@
       if (['jpg', 'jpeg'].includes(hinted)) return 'jpg';
       if (hinted === 'png') return 'png';
       if (hinted === 'webp') return 'webp';
-      if (['mp4', 'm4v', 'mov', 'webm', 'ogv', '3gp', '3g2', 'avi', 'mkv', 'mpeg', 'mpg'].includes(hinted)) return 'video';
+      if (['mp4', 'm4v', 'mov', 'webm', 'ogv', '3gp', '3g2', 'avi', 'mkv', 'mpeg', 'mpg', 'm3u8', 'mpd'].includes(hinted)) return 'video';
       const ext = parsed.pathname.split('.').pop().toLowerCase();
       if (['jpg', 'jpeg'].includes(ext)) return 'jpg';
       if (ext === 'png') return 'png';
       if (ext === 'webp') return 'webp';
-      if (['mp4', 'm4v', 'mov', 'webm', 'ogv', '3gp', '3g2', 'avi', 'mkv', 'mpeg', 'mpg'].includes(ext)) return 'video';
+      if (['mp4', 'm4v', 'mov', 'webm', 'ogv', '3gp', '3g2', 'avi', 'mkv', 'mpeg', 'mpg', 'm3u8', 'mpd'].includes(ext)) return 'video';
     } catch {
       // Unknown extension is allowed by the default filter.
     }
@@ -747,6 +911,15 @@
     return copyNormally(urls.join('\n'));
   }
 
+  function copyVideoUrlsOnly() {
+    const urls = ensureScan()
+      .filter(isVideoCandidate)
+      .map((candidate) => getDownloadUrl(candidate) || candidate.url)
+      .filter(Boolean);
+    if (!urls.length) return showMessage('No video URLs found.');
+    return copyNormally([...new Set(urls)].join('\n'));
+  }
+
   function openNormally(url) {
     const opened = window.open(url, '_blank', 'noopener,noreferrer');
     if (!opened) location.href = url;
@@ -756,7 +929,8 @@
     const candidate = typeof target === 'string' ? findCandidateByUrl(target) : target;
     const url = getDownloadUrl(target);
     if (!url) return showMessage('No downloadable media URL found.');
-    if (candidate?.url && url !== candidate.url) showMessage('Downloading full video URL instead of poster');
+    if (url.startsWith('blob:')) showMessage('Blob video detected. Tap play, then scan again for the real source. Only save videos you have permission to keep.');
+    else if (candidate?.url && url !== candidate.url) showMessage('Downloading full video URL instead of poster');
     if (state.advancedMode && api.download) {
       try {
         const result = api.download({
@@ -810,8 +984,8 @@
     collectAttributeValues(video, ['data-video', 'data-mp4', 'data-webm', 'data-hd', 'data-full', 'data-fullsrc', 'data-src']).forEach((url) => addVideoDownloadUrl(urls, url, 110));
     return urls
       .map((item) => ({ ...item, url: normalizeUrl(item.url) }))
-      .filter((item) => item.url && !item.url.startsWith('data:') && !item.url.startsWith('blob:'))
-      .sort((a, b) => b.score - a.score || b.url.length - a.url.length)[0]?.url || '';
+      .filter((item) => item.url && !item.url.startsWith('data:'))
+      .sort((a, b) => Number(a.url.startsWith('blob:')) - Number(b.url.startsWith('blob:')) || b.score - a.score || b.url.length - a.url.length)[0]?.url || '';
   }
 
   function addVideoDownloadUrl(urls, url, score) {
@@ -1014,6 +1188,7 @@
             <button type="button" data-center-action="copySelected">Copy selected URLs</button>
             <button type="button" data-center-action="exportText">Export URLs as text</button>
             <button type="button" data-center-action="copyAll">Copy all URLs</button>
+            <button type="button" data-center-action="copyVideos">Copy video URLs</button>
             <button type="button" data-center-action="showMore">Show more</button>
             <button type="button" data-center-action="close">Close</button>
           </div>
@@ -1063,6 +1238,7 @@
     if (action === 'copySelected') return copySelectedUrls();
     if (action === 'exportText') return exportUrlsAsText();
     if (action === 'copyAll') return copyAllUrls();
+    if (action === 'copyVideos') return copyVideoUrlsOnly();
     if (action === 'showMore') { state.visibleCount += 40; return renderControlCenterList(true); }
     if (action === 'collapse') return togglePanelCollapse();
     if (action === 'close') return closeControlCenter();
@@ -1229,7 +1405,10 @@
       <li>Drag the IMU bubble anywhere comfortable; tap it to open this control center.</li>
       <li>Use filters for JPG/PNG/WebP, duplicates, and large media; sort by size, filename length, or source confidence.</li>
       <li>Tap a thumbnail or Fullscreen to preview without leaving the page. Swipe down to close the preview.</li>
-      <li>Select rows, then use Open selected, Copy selected URLs, or Export URLs as text.</li>
+      <li>Select rows, then use Open selected, Copy selected URLs, Copy video URLs, or Export URLs as text.</li>
+      <li>Click/tap play and this script rescans shortly after, which helps reveal hidden <code>video.currentSrc</code> and HLS/DASH playlist URLs.</li>
+      <li>Blob/MediaSource videos may only expose a temporary object URL here; the real media segments may need to be captured from the browser Network tab instead of directly downloaded.</li>
+      <li>Only download videos that you own or have permission to save.</li>
     `;
   }
 
