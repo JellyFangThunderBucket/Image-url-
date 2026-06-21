@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Image Max URL - iPhone Compatibility Mode
 // @namespace    https://littlelooney.example/image-max-url-iphone
-// @version      2026-06-21.1
+// @version      2026-06-21.2
 // @description  iPhone/Safari companion for Image/Video Max URL: menu commands, a touch control center, safe page scanning, optional advanced API checks, HD URL guesses, filtering, sorting, and fullscreen preview.
 // @author       LittleLooney + OpenAI
 // @license      Apache-2.0
@@ -182,7 +182,7 @@
     const candidates = [];
     const selector = [
       'img', 'picture', 'source[srcset]', 'video', 'video source[src]', 'video source[srcset]', 'a[href]', '[style*="background"]',
-      '[data-src]', '[data-original]', '[data-full]', '[data-fullsrc]', '[data-large]', '[data-image]', '[data-url]',
+      '[data-src]', '[data-original]', '[data-full]', '[data-fullsrc]', '[data-large]', '[data-image]', '[data-url]', '[data-video]', '[data-mp4]', '[data-webm]', '[data-hd]',
     ].join(',');
 
     document.querySelectorAll(selector).forEach((element) => collectElementCandidates(element, candidates));
@@ -270,7 +270,7 @@
     }
     if (element instanceof HTMLAnchorElement) addCandidate(candidates, element.href, scoreUrl(element.href) + (MEDIA_EXT_RE.test(element.href) ? 40 : 0), element, 'anchor link');
 
-    collectAttributes(element, candidates, ['src', 'poster', 'data-src', 'data-original', 'data-full', 'data-fullsrc', 'data-large', 'data-image', 'data-url']);
+    collectAttributes(element, candidates, ['src', 'poster', 'data-src', 'data-original', 'data-full', 'data-fullsrc', 'data-large', 'data-image', 'data-url', 'data-video', 'data-mp4', 'data-webm', 'data-hd']);
     getBackgroundImageUrls(element).forEach((url) => addCandidate(candidates, url, scoreUrl(url) + 10, element, 'background media'));
   }
 
@@ -335,7 +335,7 @@
     if (sourceText.includes('poster')) { rules.push('video poster source'); mediaType = 'video poster'; score += 60; confidence = Math.max(confidence, CONFIDENCE.LIKELY_MEDIA); }
     if (sourceText.includes('background')) { rules.push('background media source'); mediaType = 'background media'; score += 45; confidence = Math.max(confidence, CONFIDENCE.LIKELY_MEDIA); }
     if (sourceText.includes('srcset')) { rules.push('srcset/media attribute'); score += 90; confidence = CONFIDENCE.LIKELY_MEDIA; }
-    if (/data-(?:src|original|full|fullsrc|large|image|url)/.test(sourceText)) { rules.push('media-related data attribute'); score += 50; confidence = Math.max(confidence, CONFIDENCE.LIKELY_MEDIA); }
+    if (/data-(?:src|original|full|fullsrc|large|image|url|video|mp4|webm|hd)/.test(sourceText)) { rules.push('media-related data attribute'); score += 50; confidence = Math.max(confidence, CONFIDENCE.LIKELY_MEDIA); }
     if (isKnownMediaCdn) { rules.push('known media CDN'); score += 75; confidence = Math.max(confidence, CONFIDENCE.LIKELY_MEDIA); }
     if (/(?:image|img|photo|picture|media|thumbnail|thumb|preview|gallery|album|cdn|uploads?|video|watch|stream|movie|clip)/i.test(path)) { rules.push('media-related URL path'); score += 35; confidence = Math.max(confidence, CONFIDENCE.POSSIBLE_MEDIA); }
     if (/(?:gallery|album)/i.test(path)) { mediaType = 'gallery image'; rules.push('gallery pattern'); score += 20; }
@@ -752,7 +752,11 @@
     if (!opened) location.href = url;
   }
 
-  function saveOrOpen(url) {
+  function saveOrOpen(target) {
+    const candidate = typeof target === 'string' ? findCandidateByUrl(target) : target;
+    const url = getDownloadUrl(target);
+    if (!url) return showMessage('No downloadable media URL found.');
+    if (candidate?.url && url !== candidate.url) showMessage('Downloading full video URL instead of poster');
     if (state.advancedMode && api.download) {
       try {
         const result = api.download({
@@ -768,6 +772,54 @@
       }
     }
     browserDownloadOrOpen(url);
+  }
+
+  function getDownloadUrl(target) {
+    const candidate = typeof target === 'string' ? findCandidateByUrl(target) : target;
+    if (!candidate) return typeof target === 'string' ? target : '';
+    return getFullVideoUrlForCandidate(candidate) || candidate.url || '';
+  }
+
+  function findCandidateByUrl(url) {
+    if (!url) return null;
+    return pageCandidates.find((candidate) => candidate.url === url)
+      || rawCandidates.find((candidate) => candidate.url === url)
+      || null;
+  }
+
+  function getFullVideoUrlForCandidate(candidate) {
+    if (!candidate) return '';
+    if (isVideoCandidate(candidate)) return candidate.url;
+    const element = candidate.element;
+    if (element instanceof HTMLVideoElement) return bestVideoUrlFromElement(element);
+    const closestVideo = element?.closest?.('video');
+    if (closestVideo instanceof HTMLVideoElement) return bestVideoUrlFromElement(closestVideo);
+    const nestedVideo = element?.querySelector?.('video');
+    if (nestedVideo instanceof HTMLVideoElement) return bestVideoUrlFromElement(nestedVideo);
+    return '';
+  }
+
+  function bestVideoUrlFromElement(video) {
+    const urls = [];
+    addVideoDownloadUrl(urls, video.currentSrc, 140);
+    addVideoDownloadUrl(urls, video.src, 130);
+    video.querySelectorAll('source[src], source[srcset]').forEach((source) => {
+      addVideoDownloadUrl(urls, source.src || source.getAttribute('src'), 120);
+      parseSrcset(source.getAttribute('srcset')).forEach((item) => addVideoDownloadUrl(urls, item.url, item.score + 100));
+    });
+    collectAttributeValues(video, ['data-video', 'data-mp4', 'data-webm', 'data-hd', 'data-full', 'data-fullsrc', 'data-src']).forEach((url) => addVideoDownloadUrl(urls, url, 110));
+    return urls
+      .map((item) => ({ ...item, url: normalizeUrl(item.url) }))
+      .filter((item) => item.url && !item.url.startsWith('data:') && !item.url.startsWith('blob:'))
+      .sort((a, b) => b.score - a.score || b.url.length - a.url.length)[0]?.url || '';
+  }
+
+  function addVideoDownloadUrl(urls, url, score) {
+    if (url) urls.push({ url, score: Number(score || 0) + scoreUrl(url) });
+  }
+
+  function collectAttributeValues(element, names) {
+    return names.filter((name) => element?.hasAttribute?.(name)).map((name) => element.getAttribute(name));
   }
 
   function browserDownloadOrOpen(url) {
@@ -840,7 +892,7 @@
     if (action === 'center') return openControlCenter();
     if (!selected?.url) return;
     if (action === 'open') openNormally(selected.url);
-    if (action === 'download') saveOrOpen(selected.url);
+    if (action === 'download') saveOrOpen(selected);
     if (action === 'copy') copyNormally(selected.url);
     if (action === 'preview') openFullscreenPreview(selected.url);
   }
@@ -1000,7 +1052,7 @@
     if (rowButtonUrl && rowAction) {
       if (rowAction === 'open') return openNormally(rowButtonUrl);
       if (rowAction === 'copy') return copyNormally(rowButtonUrl);
-      if (rowAction === 'save') return saveOrOpen(rowButtonUrl);
+      if (rowAction === 'save') return saveOrOpen(findCandidateByUrl(rowButtonUrl) || rowButtonUrl);
       if (rowAction === 'preview') return openFullscreenPreview(rowButtonUrl);
     }
 
