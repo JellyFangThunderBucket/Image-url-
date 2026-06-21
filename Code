@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Image Max URL - iPhone Compatibility Mode
 // @namespace    https://littlelooney.example/image-max-url-iphone
-// @version      2026-05-13.4
-// @description  iPhone/Safari companion for Image Max URL: menu commands, a touch control center, safe page scanning, optional advanced API checks, HD URL guesses, filtering, sorting, and fullscreen preview.
+// @version      2026-06-21.3
+// @description  iPhone/Safari companion for Image/Video Max URL: menu commands, a touch control center, safe page scanning, optional advanced API checks, HD URL guesses, filtering, sorting, and fullscreen preview.
 // @author       LittleLooney + OpenAI
 // @license      Apache-2.0
 // @match        *://*/*
@@ -38,13 +38,15 @@
   const MAX_BACKGROUND_SCAN_NODES = 2500;
   const MAX_ADVANCED_HEAD_CHECKS = 30;
   const IMAGE_EXT_RE = /\.(?:avif|bmp|gif|heic|heif|jpe?g|jxl|png|svg|webp)(?:[?#].*)?$/i;
+  const VIDEO_EXT_RE = /\.(?:3g2|3gp|avi|m3u8|mpd|m4v|mkv|mov|mp4|mpeg|mpg|ogv|webm)(?:[?#].*)?$/i;
+  const MEDIA_EXT_RE = /\.(?:3g2|3gp|avi|avif|bmp|gif|heic|heif|jpe?g|jxl|m3u8|mpd|m4v|mkv|mov|mp4|mpeg|mpg|ogv|png|svg|webm|webp)(?:[?#].*)?$/i;
   const SIZE_HINT_RE = /(?:^|[?&_/.-])(?:w|width|h|height|size|s|dpr|quality|q)[=:_-]?(\d{2,5})/ig;
   const STRIP_QUERY_PARAMS = new Set(['w', 'width', 'h', 'height', 'fit', 'crop', 'resize', 'quality', 'q']);
   const SAFE_MODE = 'Safe iPhone Mode';
   const ADVANCED_MODE = 'Advanced Mode';
-  const CONFIDENCE = Object.freeze({ VERIFIED_IMAGE: 5, LIKELY_IMAGE: 4, POSSIBLE_IMAGE: 3, POSSIBLE_IMAGE_PAGE: 2, PAGE_LINK: 1 });
-  const CONFIDENCE_LABELS = Object.freeze({ 5: 'VERIFIED_IMAGE', 4: 'LIKELY_IMAGE', 3: 'POSSIBLE_IMAGE', 2: 'POSSIBLE_IMAGE_PAGE', 1: 'PAGE_LINK' });
-  const KNOWN_IMAGE_CDNS = ['i.redd.it', 'preview.redd.it', 'external-preview.redd.it', 'i.imgur.com', 'imgur.com', 'images.unsplash.com', 'images.pexels.com', 'pbs.twimg.com', 'media.tenor.com', 'media.giphy.com', 'cdn.discordapp.com', 'staticflickr.com', 'wikimedia.org'];
+  const CONFIDENCE = Object.freeze({ VERIFIED_MEDIA: 5, LIKELY_MEDIA: 4, POSSIBLE_MEDIA: 3, POSSIBLE_MEDIA_PAGE: 2, PAGE_LINK: 1 });
+  const CONFIDENCE_LABELS = Object.freeze({ 5: 'VERIFIED_MEDIA', 4: 'LIKELY_MEDIA', 3: 'POSSIBLE_MEDIA', 2: 'POSSIBLE_MEDIA_PAGE', 1: 'PAGE_LINK' });
+  const KNOWN_MEDIA_CDNS = ['i.redd.it', 'preview.redd.it', 'external-preview.redd.it', 'i.imgur.com', 'imgur.com', 'images.unsplash.com', 'images.pexels.com', 'pbs.twimg.com', 'media.tenor.com', 'media.giphy.com', 'cdn.discordapp.com', 'staticflickr.com', 'wikimedia.org'];
   const CATEGORY_PAGE_RE = /\/(?:search|collections?|topics?|r|user|profile|tag)(?:\/|$|[?#])/i;
 
   const api = detectApis();
@@ -80,12 +82,19 @@
   let dragState = null;
   let previewTouchStart = null;
   let lastScanAt = 0;
+  let mediaObserver = null;
+  const seenNetworkMedia = new Set();
+  const capturedObjectUrls = new Map();
+  const watchedVideos = new WeakSet();
 
   // ---------- Bootstrap and menu commands ----------
   injectStyles();
   createActionBar();
   createFloatingButton(true);
   registerMenuCommands();
+  installDynamicMediaWatchers();
+  installNetworkMediaWatcher();
+  patchCreateObjectURLForMediaSources();
   if (isTouchDevice) installTouchHandlers();
 
   function detectApis() {
@@ -103,12 +112,164 @@
 
   function registerMenuCommands() {
     if (!api.menuCommand) return;
-    safeRegisterMenuCommand('Scan images', () => scanPage(true));
+    safeRegisterMenuCommand('Scan media', () => scanPage(true));
     safeRegisterMenuCommand('Open control center', () => openControlCenter());
-    safeRegisterMenuCommand('Copy top image URL', () => copyTopImageUrl());
-    safeRegisterMenuCommand('Open top image', () => openTopImage());
+    safeRegisterMenuCommand('Copy top media URL', () => copyTopImageUrl());
+    safeRegisterMenuCommand('Open top media', () => openTopImage());
     safeRegisterMenuCommand('Toggle floating button', () => toggleFloatingButton());
     safeRegisterMenuCommand('Help / About', () => openHelpAbout());
+  }
+
+
+  // ---------- Dynamic media watchers: click/play, mutations, lazy videos, and object URLs ----------
+  function installDynamicMediaWatchers() {
+    document.addEventListener('click', () => {
+      window.setTimeout(() => debounceScan(false), 1200);
+    }, true);
+
+    document.addEventListener('play', (event) => {
+      if (event.target instanceof HTMLVideoElement) {
+        watchVideoElement(event.target);
+        window.setTimeout(() => debounceScan(true), 500);
+      }
+    }, true);
+
+    document.querySelectorAll('video').forEach((video) => watchVideoElement(video));
+
+    mediaObserver = new MutationObserver((mutations) => {
+      let shouldRescan = false;
+      mutations.forEach((mutation) => {
+        if (mutation.type === 'childList') {
+          mutation.addedNodes.forEach((node) => {
+            if (!(node instanceof Element)) return;
+            if (node instanceof HTMLVideoElement) watchVideoElement(node);
+            node.querySelectorAll?.('video').forEach((video) => watchVideoElement(video));
+            if (node.matches?.('img, picture, source, video, a, [style*="background"]') || node.querySelector?.('img, picture, source, video, a, [style*="background"]')) shouldRescan = true;
+          });
+        }
+        if (mutation.type === 'attributes') {
+          if (mutation.target instanceof HTMLVideoElement) watchVideoElement(mutation.target);
+          shouldRescan = true;
+        }
+      });
+      if (shouldRescan) debounceScan(false);
+    });
+
+    mediaObserver.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['src', 'srcset', 'href', 'style', 'poster', 'data-src', 'data-video', 'data-mp4', 'data-webm', 'data-hd', 'data-full', 'data-fullsrc'],
+    });
+  }
+
+  function watchVideoElement(video) {
+    if (!(video instanceof HTMLVideoElement) || watchedVideos.has(video)) return;
+    watchedVideos.add(video);
+    ['loadedmetadata', 'canplay', 'play', 'sourceopen'].forEach((eventName) => {
+      video.addEventListener(eventName, () => debounceScan(false), { passive: true });
+    });
+    video.querySelectorAll('source').forEach((source) => {
+      ['loadedmetadata', 'canplay', 'play', 'sourceopen'].forEach((eventName) => {
+        source.addEventListener(eventName, () => debounceScan(false), { passive: true });
+      });
+    });
+  }
+
+  function discoverVideoUrls(video, candidates, triggerLoad = false) {
+    if (!(video instanceof HTMLVideoElement)) return [];
+    watchVideoElement(video);
+    if (!video.currentSrc && !video.src) attemptLazyVideoLoad(video);
+
+    const discovered = [];
+    addDiscoveredVideoUrl(discovered, candidates, video.currentSrc, video, 'video currentSrc', 180);
+    addDiscoveredVideoUrl(discovered, candidates, video.src || video.getAttribute('src'), video, 'video src', 170);
+    video.querySelectorAll('source').forEach((source) => {
+      addDiscoveredVideoUrl(discovered, candidates, source.src || source.getAttribute('src'), source, 'video source src', 160);
+      parseSrcset(source.getAttribute('srcset')).forEach((item) => addDiscoveredVideoUrl(discovered, candidates, item.url, source, 'video source srcset', item.score + 140));
+    });
+    collectAttributeValues(video, ['data-video', 'data-mp4', 'data-webm', 'data-hd', 'data-full', 'data-fullsrc', 'data-src']).forEach((url) => {
+      addDiscoveredVideoUrl(discovered, candidates, url, video, 'video data attribute', 145);
+    });
+
+    if (triggerLoad && discovered.some((url) => String(url).startsWith('blob:'))) {
+      showMessage('Blob video detected. Tap play, then scan again for the real source.');
+    }
+    return discovered;
+  }
+
+  function attemptLazyVideoLoad(video) {
+    try { video.load(); } catch (error) { console.debug(`[${PATCH_ID}] video.load() failed`, error); }
+    try {
+      const playResult = video.play();
+      if (playResult && typeof playResult.catch === 'function') playResult.catch(() => {});
+    } catch (error) {
+      console.debug(`[${PATCH_ID}] video.play() blocked`, error);
+    }
+  }
+
+  function addDiscoveredVideoUrl(discovered, candidates, rawUrl, element, source, score) {
+    const url = normalizeUrl(rawUrl);
+    if (!url) return;
+    discovered.push(url);
+    addCandidate(candidates, url, Number(score || 0) + scoreUrl(url), element, source);
+  }
+
+  function installNetworkMediaWatcher() {
+    const originalFetch = window.fetch;
+    if (typeof originalFetch === 'function' && !originalFetch.__imuPatched) {
+      const patchedFetch = function(input, init) {
+        rememberNetworkUrl(typeof input === 'string' ? input : input?.url);
+        return originalFetch.apply(this, arguments);
+      };
+      patchedFetch.__imuPatched = true;
+      window.fetch = patchedFetch;
+    }
+
+    const originalOpen = XMLHttpRequest.prototype.open;
+    if (typeof originalOpen === 'function' && !originalOpen.__imuPatched) {
+      const patchedOpen = function(method, url) {
+        rememberNetworkUrl(url);
+        return originalOpen.apply(this, arguments);
+      };
+      patchedOpen.__imuPatched = true;
+      XMLHttpRequest.prototype.open = patchedOpen;
+    }
+  }
+
+  function rememberNetworkUrl(rawUrl) {
+    const url = normalizeUrl(rawUrl);
+    if (!url || seenNetworkMedia.has(url)) return;
+    if (MEDIA_EXT_RE.test(url) || /m3u8|mpd|mp4|webm|video|image|media/i.test(url)) {
+      seenNetworkMedia.add(url);
+      addCandidate(rawCandidates, url, scoreUrl(url) + 300, null, 'network observed');
+      rawCandidates = chooseLargestCandidates(dedupeByUrl(rawCandidates));
+      pageCandidates = getDisplayCandidates();
+      state.totalFound = rawCandidates.length;
+      state.uniqueFound = dedupeCandidates(rawCandidates).length;
+      refreshDisplayCandidates();
+    }
+  }
+
+  function patchCreateObjectURLForMediaSources() {
+    const nativeCreate = URL.createObjectURL?.bind(URL);
+    if (!nativeCreate || nativeCreate.__imuPatched) return;
+    const patched = (object) => {
+      const url = nativeCreate(object);
+      const isMediaSource = typeof MediaSource !== 'undefined' && object instanceof MediaSource;
+      if (isMediaSource || object instanceof Blob) {
+        capturedObjectUrls.set(url, {
+          score: isMediaSource ? 260 : 180,
+          element: null,
+          source: isMediaSource ? 'MediaSource blob/object URL' : 'Blob object URL',
+        });
+        if (isMediaSource) object.addEventListener('sourceopen', () => debounceScan(false), { once: false });
+        debounceScan(false);
+      }
+      return url;
+    };
+    patched.__imuPatched = true;
+    URL.createObjectURL = patched;
   }
 
   function safeRegisterMenuCommand(label, callback) {
@@ -167,7 +328,7 @@
     const element = findMediaElement(eventPath) || findMediaElement([document.elementFromPoint(x, y)]);
     if (!element) return;
     const result = getBestImageForElement(element);
-    if (!result?.url) return showMessage('No image URL found here');
+    if (!result?.url) return showMessage('No media URL found here');
     selected = result;
     state.selectedUrls.add(result.url);
     showHighlight(element);
@@ -179,17 +340,19 @@
   function scanPage(announce = false) {
     const candidates = [];
     const selector = [
-      'img', 'picture', 'source[srcset]', 'video[poster]', 'a[href]', '[style*="background"]',
-      '[data-src]', '[data-original]', '[data-full]', '[data-fullsrc]', '[data-large]', '[data-image]', '[data-url]',
+      'img', 'picture', 'source[srcset]', 'video', 'video source[src]', 'video source[srcset]', 'a[href]', '[style*="background"]',
+      '[data-src]', '[data-original]', '[data-full]', '[data-fullsrc]', '[data-large]', '[data-image]', '[data-url]', '[data-video]', '[data-mp4]', '[data-webm]', '[data-hd]',
     ].join(',');
 
     document.querySelectorAll(selector).forEach((element) => collectElementCandidates(element, candidates));
+    document.querySelectorAll('video').forEach((video) => discoverVideoUrls(video, candidates, announce));
+    capturedObjectUrls.forEach((meta, url) => addCandidate(candidates, url, meta.score, meta.element, meta.source));
 
     // Computed background scans are capped to keep Safari responsive on huge pages.
     [...(document.body || document.documentElement).querySelectorAll('*')]
       .slice(0, MAX_BACKGROUND_SCAN_NODES)
       .forEach((element) => {
-        getBackgroundImageUrls(element).forEach((url) => addCandidate(candidates, url, scoreUrl(url) + 10, element, 'background image'));
+        getBackgroundImageUrls(element).forEach((url) => addCandidate(candidates, url, scoreUrl(url) + 10, element, 'background media'));
       });
 
     state.totalFound = candidates.length;
@@ -199,7 +362,7 @@
     state.visibleCount = Math.min(Math.max(state.visibleCount, 40), Math.max(pageCandidates.length, 40));
     lastScanAt = Date.now();
     if (pageCandidates[0] && !selected?.url) selected = pageCandidates[0];
-    if (announce) showMessage(`Scanned ${state.uniqueFound} unique image URL${state.uniqueFound === 1 ? '' : 's'}`);
+    if (announce) showMessage(`Scanned ${state.uniqueFound} unique media URL${state.uniqueFound === 1 ? '' : 's'}`);
     renderControlCenterList();
     return pageCandidates;
   }
@@ -218,7 +381,7 @@
     for (const item of path || []) {
       if (!(item instanceof Element)) continue;
       if (isMediaCandidate(item)) return item;
-      const nested = item.querySelector?.('img, picture, source[srcset], video[poster], [style*="background"]');
+      const nested = item.querySelector?.('video, video source[src], source[src], source[srcset], img, picture, [style*="background"]');
       if (nested && isMediaCandidate(nested)) return nested;
     }
     return null;
@@ -226,7 +389,7 @@
 
   function isMediaCandidate(element) {
     if (!element || !(element instanceof Element)) return false;
-    if (element.matches('img, picture, source[srcset], video[poster]')) return true;
+    if (element.matches('video, video source[src], source[src], source[srcset], img, picture')) return true;
     return Boolean(getBackgroundImageUrls(element).length);
   }
 
@@ -256,12 +419,21 @@
       element.querySelectorAll('source[srcset], img').forEach((child) => collectElementCandidates(child, candidates));
     }
 
-    if (element instanceof HTMLSourceElement) collectSrcset(element.getAttribute('srcset'), candidates, element, 'source srcset');
-    if (element instanceof HTMLVideoElement) addCandidate(candidates, element.poster, scoreUrl(element.poster) + 20, element, 'video poster');
-    if (element instanceof HTMLAnchorElement) addCandidate(candidates, element.href, scoreUrl(element.href) + (IMAGE_EXT_RE.test(element.href) ? 40 : 0), element, 'anchor link');
+    if (element instanceof HTMLSourceElement) {
+      collectSrcset(element.getAttribute('srcset'), candidates, element, 'source srcset');
+      addCandidate(candidates, element.src || element.getAttribute('src'), scoreUrl(element.src || element.getAttribute('src')) + 90, element, 'video source src');
+    }
+    if (element instanceof HTMLVideoElement) {
+      discoverVideoUrls(element, candidates, false);
+      addCandidate(candidates, element.currentSrc, scoreUrl(element.currentSrc) + 140, element, 'video currentSrc');
+      addCandidate(candidates, element.src, scoreUrl(element.src) + 130, element, 'video src');
+      addCandidate(candidates, element.poster, scoreUrl(element.poster) + 20, element, 'video poster');
+      element.querySelectorAll('source[src], source[srcset]').forEach((child) => collectElementCandidates(child, candidates));
+    }
+    if (element instanceof HTMLAnchorElement) addCandidate(candidates, element.href, scoreUrl(element.href) + (MEDIA_EXT_RE.test(element.href) ? 40 : 0), element, 'anchor link');
 
-    collectAttributes(element, candidates, ['src', 'poster', 'data-src', 'data-original', 'data-full', 'data-fullsrc', 'data-large', 'data-image', 'data-url']);
-    getBackgroundImageUrls(element).forEach((url) => addCandidate(candidates, url, scoreUrl(url) + 10, element, 'background image'));
+    collectAttributes(element, candidates, ['src', 'poster', 'data-src', 'data-original', 'data-full', 'data-fullsrc', 'data-large', 'data-image', 'data-url', 'data-video', 'data-mp4', 'data-webm', 'data-hd']);
+    getBackgroundImageUrls(element).forEach((url) => addCandidate(candidates, url, scoreUrl(url) + 10, element, 'background media'));
   }
 
   function collectAttributes(element, candidates, names) {
@@ -276,7 +448,7 @@
 
   function addCandidate(candidates, rawUrl, score = 0, element = null, source = 'page URL') {
     const url = normalizeUrl(rawUrl);
-    if (!url || url.startsWith('data:') || url.startsWith('blob:')) return;
+    if (!url || url.startsWith('data:')) return;
     const analysis = analyzeCandidate(url, element, source, score);
     if (analysis.reject) return;
     const dimensions = getCandidateDimensions(element, url);
@@ -308,33 +480,37 @@
     const path = `${parsed?.pathname || ''}${parsed?.search || ''}`.toLowerCase();
     const host = parsed?.hostname.replace(/^www\./, '').toLowerCase() || '';
     const isAnchor = element instanceof HTMLAnchorElement && sourceText === 'anchor link';
-    const containsMedia = Boolean(element?.querySelector?.('img, picture, video[poster], source[srcset]'));
+    const containsMedia = Boolean(element?.querySelector?.('img, picture, video, video source[src], source[srcset]'));
     let score = Number(baseScore || 0);
-    let confidence = CONFIDENCE.POSSIBLE_IMAGE;
-    let mediaType = 'image';
+    let confidence = CONFIDENCE.POSSIBLE_MEDIA;
+    let mediaType = 'media';
 
     const hasImageExtension = IMAGE_EXT_RE.test(url);
-    const isKnownImageCdn = KNOWN_IMAGE_CDNS.some((cdn) => host === cdn || host.endsWith(`.${cdn}`));
+    const hasVideoExtension = VIDEO_EXT_RE.test(url);
+    const hasMediaExtension = hasImageExtension || hasVideoExtension;
+    const isKnownMediaCdn = KNOWN_MEDIA_CDNS.some((cdn) => host === cdn || host.endsWith(`.${cdn}`));
     const isCategoryPage = isCategoryPageUrl(parsed, path);
 
-    if (hasImageExtension) { rules.push('known image extension'); score += 80; confidence = CONFIDENCE.LIKELY_IMAGE; }
+    if (hasImageExtension) { rules.push('known image extension'); score += 80; confidence = CONFIDENCE.LIKELY_MEDIA; }
+    if (hasVideoExtension) { rules.push('known video/HLS/DASH extension'); mediaType = /\.(?:m3u8|mpd)(?:[?#]|$)/i.test(url) ? 'video playlist' : 'video'; score += 95; confidence = CONFIDENCE.LIKELY_MEDIA; }
+    if (url.startsWith('blob:')) { rules.push('blob/object media URL'); mediaType = 'video blob/object URL'; score += 120; confidence = CONFIDENCE.LIKELY_MEDIA; }
     if (/\.(?:gif)(?:[?#]|$)/i.test(url)) mediaType = 'gif';
-    if (sourceText.includes('poster')) { rules.push('video poster source'); mediaType = 'video poster'; score += 60; confidence = Math.max(confidence, CONFIDENCE.LIKELY_IMAGE); }
-    if (sourceText.includes('background')) { rules.push('background image source'); mediaType = 'background image'; score += 45; confidence = Math.max(confidence, CONFIDENCE.LIKELY_IMAGE); }
-    if (sourceText.includes('srcset')) { rules.push('srcset/image attribute'); score += 90; confidence = CONFIDENCE.LIKELY_IMAGE; }
-    if (/data-(?:src|original|full|fullsrc|large|image|url)/.test(sourceText)) { rules.push('image-related data attribute'); score += 50; confidence = Math.max(confidence, CONFIDENCE.LIKELY_IMAGE); }
-    if (isKnownImageCdn) { rules.push('known image CDN'); score += 75; confidence = Math.max(confidence, CONFIDENCE.LIKELY_IMAGE); }
-    if (/(?:image|img|photo|picture|media|thumbnail|thumb|preview|gallery|album|cdn|uploads?)/i.test(path)) { rules.push('image-related URL path'); score += 35; confidence = Math.max(confidence, CONFIDENCE.POSSIBLE_IMAGE); }
+    if (sourceText.includes('poster')) { rules.push('video poster source'); mediaType = 'video poster'; score += 60; confidence = Math.max(confidence, CONFIDENCE.LIKELY_MEDIA); }
+    if (sourceText.includes('background')) { rules.push('background media source'); mediaType = 'background media'; score += 45; confidence = Math.max(confidence, CONFIDENCE.LIKELY_MEDIA); }
+    if (sourceText.includes('srcset')) { rules.push('srcset/media attribute'); score += 90; confidence = CONFIDENCE.LIKELY_MEDIA; }
+    if (/data-(?:src|original|full|fullsrc|large|image|url|video|mp4|webm|hd)/.test(sourceText)) { rules.push('media-related data attribute'); score += 50; confidence = Math.max(confidence, CONFIDENCE.LIKELY_MEDIA); }
+    if (isKnownMediaCdn) { rules.push('known media CDN'); score += 75; confidence = Math.max(confidence, CONFIDENCE.LIKELY_MEDIA); }
+    if (/(?:image|img|photo|picture|media|thumbnail|thumb|preview|gallery|album|cdn|uploads?|video|watch|stream|movie|clip)/i.test(path)) { rules.push('media-related URL path'); score += 35; confidence = Math.max(confidence, CONFIDENCE.POSSIBLE_MEDIA); }
     if (/(?:gallery|album)/i.test(path)) { mediaType = 'gallery image'; rules.push('gallery pattern'); score += 20; }
     if (containsMedia) {
       rules.push('anchor contains media element');
       score += 70;
-      confidence = Math.max(confidence, isAnchor && isCategoryPage && !hasImageExtension && !isKnownImageCdn ? CONFIDENCE.POSSIBLE_IMAGE_PAGE : CONFIDENCE.LIKELY_IMAGE);
+      confidence = Math.max(confidence, isAnchor && isCategoryPage && !hasMediaExtension && !isKnownMediaCdn ? CONFIDENCE.POSSIBLE_MEDIA_PAGE : CONFIDENCE.LIKELY_MEDIA);
     }
-    if (isAnchor && isCategoryPage && !hasImageExtension && !isKnownImageCdn) {
+    if (isAnchor && isCategoryPage && !hasMediaExtension && !isKnownMediaCdn) {
       rules.push('category/search/profile page URL');
-      confidence = Math.min(confidence, CONFIDENCE.POSSIBLE_IMAGE_PAGE);
-      mediaType = mediaType === 'image' ? 'page link' : mediaType;
+      confidence = Math.min(confidence, CONFIDENCE.POSSIBLE_MEDIA_PAGE);
+      mediaType = mediaType === 'media' ? 'page link' : mediaType;
     }
 
     const navPenalty = navigationPenalty(parsed, path);
@@ -344,17 +520,18 @@
     }
 
     if (isAnchor) {
-      const anchorQualifies = rules.some((rule) => ['known image extension', 'known image CDN', 'image-related URL path', 'srcset/image attribute', 'anchor contains media element', 'gallery pattern'].includes(rule)) || score >= 180;
+      const anchorQualifies = rules.some((rule) => ['known image extension', 'known video extension', 'known media CDN', 'media-related URL path', 'srcset/media attribute', 'anchor contains media element', 'gallery pattern'].includes(rule)) || score >= 180;
       if (!anchorQualifies) {
-        return { reject: true, score, confidence: CONFIDENCE.PAGE_LINK, mediaType: 'page link', rules: rules.concat('rejected generic anchor'), reason: 'Rejected anchor link: no image extension/CDN/path/media child/high score.' };
+        return { reject: true, score, confidence: CONFIDENCE.PAGE_LINK, mediaType: 'page link', rules: rules.concat('rejected generic anchor'), reason: 'Rejected anchor link: no media extension/CDN/path/media child/high score.' };
       }
-      if (navPenalty && confidence < CONFIDENCE.POSSIBLE_IMAGE_PAGE) {
+      if (navPenalty && confidence < CONFIDENCE.POSSIBLE_MEDIA_PAGE) {
         return { reject: true, score, confidence: CONFIDENCE.PAGE_LINK, mediaType: 'page link', rules: rules.concat('rejected navigation anchor'), reason: `Rejected navigation/profile/comment link (${navPenalty.reason}).` };
       }
-      if (confidence < CONFIDENCE.LIKELY_IMAGE && confidence !== CONFIDENCE.POSSIBLE_IMAGE_PAGE) confidence = CONFIDENCE.PAGE_LINK;
+      if (confidence < CONFIDENCE.LIKELY_MEDIA && confidence !== CONFIDENCE.POSSIBLE_MEDIA_PAGE) confidence = CONFIDENCE.PAGE_LINK;
     }
 
-    if (score < -20 && confidence <= CONFIDENCE.POSSIBLE_IMAGE) return { reject: true, score, confidence: CONFIDENCE.PAGE_LINK, mediaType: 'page link', rules, reason: 'Rejected low-score page/navigation URL.' };
+    if (url.startsWith('blob:')) return { reject: false, score, confidence, mediaType, rules, reason: 'Blob/Object URL discovered from video or MediaSource. Direct download may not contain the real media segments.' };
+    if (score < -20 && confidence <= CONFIDENCE.POSSIBLE_MEDIA) return { reject: true, score, confidence: CONFIDENCE.PAGE_LINK, mediaType: 'page link', rules, reason: 'Rejected low-score page/navigation URL.' };
     return { reject: false, score, confidence, mediaType, rules, reason: rules.join(', ') || 'weak page URL signal' };
   }
 
@@ -377,7 +554,7 @@
       if (/^\/user\//.test(path)) return { penalty: 180, reason: 'reddit profile link' };
     }
     if (/\/(?:profile|user|users|account|login|signup|settings|comments?|rules|answers|about|help|privacy|terms)(?:\/|$|[?#])/.test(path)) return { penalty: 140, reason: 'generic page/navigation link' };
-    if (!IMAGE_EXT_RE.test(path) && /\/(?:r|u|user|comments?|posts?)\//.test(path)) return { penalty: 100, reason: 'profile/comment/navigation pattern' };
+    if (!MEDIA_EXT_RE.test(path) && /\/(?:r|u|user|comments?|posts?)\//.test(path)) return { penalty: 100, reason: 'profile/comment/navigation pattern' };
     return null;
   }
 
@@ -493,11 +670,12 @@
   }
 
   function candidatePassesFilters(candidate) {
-    if (state.verifiedOnly && candidate.confidence !== CONFIDENCE.VERIFIED_IMAGE) return false;
-    if (state.likelyOnly && candidate.confidence < CONFIDENCE.LIKELY_IMAGE) return false;
+    if (state.verifiedOnly && candidate.confidence !== CONFIDENCE.VERIFIED_MEDIA) return false;
+    if (state.likelyOnly && candidate.confidence < CONFIDENCE.LIKELY_MEDIA) return false;
     if (!state.includePageLinks && candidate.confidence === CONFIDENCE.PAGE_LINK) return false;
     if (state.filterType === 'common' && !['jpg', 'png', 'webp'].includes(extensionForUrl(candidate.url))) return false;
-    if (!['all', 'common'].includes(state.filterType) && extensionForUrl(candidate.url) !== state.filterType) return false;
+    if (state.filterType === 'video' && !isVideoCandidate(candidate)) return false;
+    if (!['all', 'common', 'video'].includes(state.filterType) && extensionForUrl(candidate.url) !== state.filterType) return false;
     if (state.largeOnly && estimatedPixels(candidate) < 700 * 700 && effectiveScore(candidate) < 1200) return false;
     return true;
   }
@@ -517,14 +695,22 @@
       if (['jpg', 'jpeg'].includes(hinted)) return 'jpg';
       if (hinted === 'png') return 'png';
       if (hinted === 'webp') return 'webp';
+      if (['mp4', 'm4v', 'mov', 'webm', 'ogv', '3gp', '3g2', 'avi', 'mkv', 'mpeg', 'mpg', 'm3u8', 'mpd'].includes(hinted)) return 'video';
       const ext = parsed.pathname.split('.').pop().toLowerCase();
       if (['jpg', 'jpeg'].includes(ext)) return 'jpg';
       if (ext === 'png') return 'png';
       if (ext === 'webp') return 'webp';
+      if (['mp4', 'm4v', 'mov', 'webm', 'ogv', '3gp', '3g2', 'avi', 'mkv', 'mpeg', 'mpg', 'm3u8', 'mpd'].includes(ext)) return 'video';
     } catch {
       // Unknown extension is allowed by the default filter.
     }
     return 'other';
+  }
+
+  function isVideoCandidate(candidateOrUrl) {
+    const url = typeof candidateOrUrl === 'string' ? candidateOrUrl : candidateOrUrl?.url;
+    const type = typeof candidateOrUrl === 'string' ? '' : String(candidateOrUrl?.mediaType || '');
+    return VIDEO_EXT_RE.test(String(url || '')) || /video/i.test(type);
   }
 
   function estimatedPixels(candidate) {
@@ -535,7 +721,7 @@
     const source = String(candidate.source || '');
     if (candidate.checked && candidate.ok) return 100;
     if (source.includes('srcset')) return 80;
-    if (source.includes('currentSrc') || source.includes('img src')) return 70;
+    if (source.includes('currentSrc') || source.includes('img src') || source.includes('video src')) return 70;
     if (source.includes('data-') || source.includes('background')) return 55;
     if (source.includes('anchor')) return 45;
     return 30;
@@ -553,7 +739,7 @@
   }
 
   function effectiveScore(candidate) {
-    const verifiedBonus = candidate.confidence === CONFIDENCE.VERIFIED_IMAGE || (candidate.kind === 'guess' && candidate.ok && candidate.checked) ? 2500 : 0;
+    const verifiedBonus = candidate.confidence === CONFIDENCE.VERIFIED_MEDIA || (candidate.kind === 'guess' && candidate.ok && candidate.checked) ? 2500 : 0;
     const pageBonus = candidate.kind === 'page' ? 100 : 0;
     const lengthBonus = candidate.contentLength ? Math.min(2200, Math.log2(candidate.contentLength) * 90) : 0;
     return Number(candidate.score || 0) + verifiedBonus + pageBonus + lengthBonus + confidenceValue(candidate) * 60;
@@ -578,7 +764,7 @@
   }
 
   function scoreUrl(url) {
-    let score = IMAGE_EXT_RE.test(String(url || '')) ? 50 : 0;
+    let score = MEDIA_EXT_RE.test(String(url || '')) ? 50 : 0;
     let match;
     SIZE_HINT_RE.lastIndex = 0;
     while ((match = SIZE_HINT_RE.exec(String(url || '')))) score = Math.max(score, Number(match[1]));
@@ -633,7 +819,7 @@
     state.isChecking = true;
     renderControlCenterList();
     const base = ensureScan().slice(0, 20);
-    const pageChecks = base.filter((candidate) => candidate.confidence < CONFIDENCE.VERIFIED_IMAGE).slice(0, 10);
+    const pageChecks = base.filter((candidate) => candidate.confidence < CONFIDENCE.VERIFIED_MEDIA).slice(0, 10);
     const guesses = pageChecks.concat(base.flatMap(generateHdGuesses).filter((candidate) => candidate.kind === 'guess')).slice(0, MAX_ADVANCED_HEAD_CHECKS);
     const passed = [];
 
@@ -643,12 +829,12 @@
         ...guess,
         checked: true,
         ok: true,
-        confidence: CONFIDENCE.VERIFIED_IMAGE,
+        confidence: CONFIDENCE.VERIFIED_MEDIA,
         contentLength: result.contentLength,
-        mediaType: result.contentType.includes('gif') ? 'gif' : guess.mediaType,
+        mediaType: result.contentType.includes('video/') ? 'video' : (result.contentType.includes('gif') ? 'gif' : guess.mediaType),
         kind: guess.kind || 'page',
-        rules: [...(guess.rules || []), `HEAD verified ${result.contentType || 'image'}`, result.contentLength ? `content-length ${result.contentLength}` : 'no content-length'],
-        debugReason: `${guess.debugReason || ''}; Advanced Mode HEAD verified image content-type`,
+        rules: [...(guess.rules || []), `HEAD verified ${result.contentType || 'media'}`, result.contentLength ? `content-length ${result.contentLength}` : 'no content-length'],
+        debugReason: `${guess.debugReason || ''}; Advanced Mode HEAD verified media content-type`,
       });
     }
 
@@ -679,7 +865,7 @@
             const headers = String(response.responseHeaders || '').toLowerCase();
             const contentType = /content-type:\s*([^\n;]+)/i.exec(headers)?.[1]?.trim() || '';
             const contentLength = Number(/content-length:\s*(\d+)/i.exec(headers)?.[1] || 0);
-            const ok = response.status >= 200 && response.status < 400 && (contentType.includes('image/') || IMAGE_EXT_RE.test(url));
+            const ok = response.status >= 200 && response.status < 400 && (contentType.includes('image/') || contentType.includes('video/') || MEDIA_EXT_RE.test(url));
             done({ ok, contentType, contentLength });
           },
           onerror: () => done({ ok: false, contentType: '', contentLength: 0 }),
@@ -699,30 +885,39 @@
 
   function copyTopImageUrl() {
     const top = getTopCandidate();
-    if (!top?.url) return showMessage('No image URL found. Try Scan images.');
+    if (!top?.url) return showMessage('No media URL found. Try Scan media.');
     return copyNormally(top.url);
   }
 
   function openTopImage() {
     const top = getTopCandidate();
-    if (!top?.url) return showMessage('No image URL found. Try Scan images.');
+    if (!top?.url) return showMessage('No media URL found. Try Scan media.');
     return openNormally(top.url);
   }
 
   function openSelected() {
     const selectedCandidates = ensureScan().filter((candidate) => state.selectedUrls.has(candidate.url));
-    if (!selectedCandidates.length) return showMessage('Select images first.');
+    if (!selectedCandidates.length) return showMessage('Select media first.');
     selectedCandidates.forEach((candidate, index) => {
       if (index === 0) openNormally(candidate.url);
       else window.setTimeout(() => openNormally(candidate.url), index * 250);
     });
-    showMessage(`Opening ${selectedCandidates.length} selected image${selectedCandidates.length === 1 ? '' : 's'}; Safari may block extra tabs.`);
+    showMessage(`Opening ${selectedCandidates.length} selected media item${selectedCandidates.length === 1 ? '' : 's'}; Safari may block extra tabs.`);
   }
 
   function copyAllUrls() {
     const urls = ensureScan().map((candidate) => candidate.url);
-    if (!urls.length) return showMessage('No image URLs found.');
+    if (!urls.length) return showMessage('No media URLs found.');
     return copyNormally(urls.join('\n'));
+  }
+
+  function copyVideoUrlsOnly() {
+    const urls = ensureScan()
+      .filter(isVideoCandidate)
+      .map((candidate) => getDownloadUrl(candidate) || candidate.url)
+      .filter(Boolean);
+    if (!urls.length) return showMessage('No video URLs found.');
+    return copyNormally([...new Set(urls)].join('\n'));
   }
 
   function openNormally(url) {
@@ -730,7 +925,12 @@
     if (!opened) location.href = url;
   }
 
-  function saveOrOpen(url) {
+  function saveOrOpen(target) {
+    const candidate = typeof target === 'string' ? findCandidateByUrl(target) : target;
+    const url = getDownloadUrl(target);
+    if (!url) return showMessage('No downloadable media URL found.');
+    if (url.startsWith('blob:')) showMessage('Blob video detected. Tap play, then scan again for the real source. Only save videos you have permission to keep.');
+    else if (candidate?.url && url !== candidate.url) showMessage('Downloading full video URL instead of poster');
     if (state.advancedMode && api.download) {
       try {
         const result = api.download({
@@ -748,6 +948,54 @@
     browserDownloadOrOpen(url);
   }
 
+  function getDownloadUrl(target) {
+    const candidate = typeof target === 'string' ? findCandidateByUrl(target) : target;
+    if (!candidate) return typeof target === 'string' ? target : '';
+    return getFullVideoUrlForCandidate(candidate) || candidate.url || '';
+  }
+
+  function findCandidateByUrl(url) {
+    if (!url) return null;
+    return pageCandidates.find((candidate) => candidate.url === url)
+      || rawCandidates.find((candidate) => candidate.url === url)
+      || null;
+  }
+
+  function getFullVideoUrlForCandidate(candidate) {
+    if (!candidate) return '';
+    if (isVideoCandidate(candidate)) return candidate.url;
+    const element = candidate.element;
+    if (element instanceof HTMLVideoElement) return bestVideoUrlFromElement(element);
+    const closestVideo = element?.closest?.('video');
+    if (closestVideo instanceof HTMLVideoElement) return bestVideoUrlFromElement(closestVideo);
+    const nestedVideo = element?.querySelector?.('video');
+    if (nestedVideo instanceof HTMLVideoElement) return bestVideoUrlFromElement(nestedVideo);
+    return '';
+  }
+
+  function bestVideoUrlFromElement(video) {
+    const urls = [];
+    addVideoDownloadUrl(urls, video.currentSrc, 140);
+    addVideoDownloadUrl(urls, video.src, 130);
+    video.querySelectorAll('source[src], source[srcset]').forEach((source) => {
+      addVideoDownloadUrl(urls, source.src || source.getAttribute('src'), 120);
+      parseSrcset(source.getAttribute('srcset')).forEach((item) => addVideoDownloadUrl(urls, item.url, item.score + 100));
+    });
+    collectAttributeValues(video, ['data-video', 'data-mp4', 'data-webm', 'data-hd', 'data-full', 'data-fullsrc', 'data-src']).forEach((url) => addVideoDownloadUrl(urls, url, 110));
+    return urls
+      .map((item) => ({ ...item, url: normalizeUrl(item.url) }))
+      .filter((item) => item.url && !item.url.startsWith('data:'))
+      .sort((a, b) => Number(a.url.startsWith('blob:')) - Number(b.url.startsWith('blob:')) || b.score - a.score || b.url.length - a.url.length)[0]?.url || '';
+  }
+
+  function addVideoDownloadUrl(urls, url, score) {
+    if (url) urls.push({ url, score: Number(score || 0) + scoreUrl(url) });
+  }
+
+  function collectAttributeValues(element, names) {
+    return names.filter((name) => element?.hasAttribute?.(name)).map((name) => element.getAttribute(name));
+  }
+
   function browserDownloadOrOpen(url) {
     const anchor = document.createElement('a');
     anchor.href = url;
@@ -761,9 +1009,9 @@
 
   function filenameFromUrl(url) {
     try {
-      return decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop() || 'image');
+      return decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop() || 'media');
     } catch {
-      return 'image';
+      return 'media';
     }
   }
 
@@ -772,7 +1020,7 @@
       try {
         const result = api.setClipboard(text, 'text');
         if (result && typeof result.then === 'function') await result;
-        showMessage(text.includes('\n') ? 'Image URLs copied' : 'Image URL copied');
+        showMessage(text.includes('\n') ? 'Media URLs copied' : 'Media URL copied');
         return;
       } catch (error) {
         console.warn(`[${PATCH_ID}] GM clipboard failed; using browser fallback`, error);
@@ -782,9 +1030,9 @@
     try {
       if (!navigator.clipboard?.writeText) throw new Error('Clipboard API unavailable');
       await navigator.clipboard.writeText(text);
-      showMessage(text.includes('\n') ? 'Image URLs copied' : 'Image URL copied');
+      showMessage(text.includes('\n') ? 'Media URLs copied' : 'Media URL copied');
     } catch {
-      window.prompt('Copy this image URL:', text);
+      window.prompt('Copy this media URL:', text);
     }
   }
 
@@ -818,7 +1066,7 @@
     if (action === 'center') return openControlCenter();
     if (!selected?.url) return;
     if (action === 'open') openNormally(selected.url);
-    if (action === 'download') saveOrOpen(selected.url);
+    if (action === 'download') saveOrOpen(selected);
     if (action === 'copy') copyNormally(selected.url);
     if (action === 'preview') openFullscreenPreview(selected.url);
   }
@@ -925,12 +1173,12 @@
           <section id="${PATCH_ID}-status" class="${PATCH_ID}-status"></section>
           <label class="${PATCH_ID}-advanced"><input type="checkbox" id="${PATCH_ID}-advanced-toggle"> Advanced Mode</label>
           <div class="${PATCH_ID}-filters">
-            <label>Type <select id="${PATCH_ID}-filter-type"><option value="all">All</option><option value="common">JPG/PNG/WebP only</option><option value="jpg">JPG only</option><option value="png">PNG only</option><option value="webp">WebP only</option></select></label>
+            <label>Type <select id="${PATCH_ID}-filter-type"><option value="all">All</option><option value="common">JPG/PNG/WebP only</option><option value="jpg">JPG only</option><option value="png">PNG only</option><option value="webp">WebP only</option><option value="video">Videos only</option></select></label>
             <label>Sort <select id="${PATCH_ID}-sort"><option value="size">Estimated size</option><option value="filename">Filename length</option><option value="confidence">Source confidence</option></select></label>
             <label><input type="checkbox" id="${PATCH_ID}-hide-dupes" checked> Hide duplicates</label>
             <label><input type="checkbox" id="${PATCH_ID}-large-only"> Large only</label>
             <label><input type="checkbox" id="${PATCH_ID}-verified-only"> Verified only</label>
-            <label><input type="checkbox" id="${PATCH_ID}-likely-only" checked> Likely images only</label>
+            <label><input type="checkbox" id="${PATCH_ID}-likely-only" checked> Likely media only</label>
             <label><input type="checkbox" id="${PATCH_ID}-include-page-links"> Include page links</label>
           </div>
           <div class="${PATCH_ID}-actions">
@@ -940,6 +1188,7 @@
             <button type="button" data-center-action="copySelected">Copy selected URLs</button>
             <button type="button" data-center-action="exportText">Export URLs as text</button>
             <button type="button" data-center-action="copyAll">Copy all URLs</button>
+            <button type="button" data-center-action="copyVideos">Copy video URLs</button>
             <button type="button" data-center-action="showMore">Show more</button>
             <button type="button" data-center-action="close">Close</button>
           </div>
@@ -978,7 +1227,7 @@
     if (rowButtonUrl && rowAction) {
       if (rowAction === 'open') return openNormally(rowButtonUrl);
       if (rowAction === 'copy') return copyNormally(rowButtonUrl);
-      if (rowAction === 'save') return saveOrOpen(rowButtonUrl);
+      if (rowAction === 'save') return saveOrOpen(findCandidateByUrl(rowButtonUrl) || rowButtonUrl);
       if (rowAction === 'preview') return openFullscreenPreview(rowButtonUrl);
     }
 
@@ -989,6 +1238,7 @@
     if (action === 'copySelected') return copySelectedUrls();
     if (action === 'exportText') return exportUrlsAsText();
     if (action === 'copyAll') return copyAllUrls();
+    if (action === 'copyVideos') return copyVideoUrlsOnly();
     if (action === 'showMore') { state.visibleCount += 40; return renderControlCenterList(true); }
     if (action === 'collapse') return togglePanelCollapse();
     if (action === 'close') return closeControlCenter();
@@ -1006,30 +1256,30 @@
     advancedToggle.checked = state.advancedMode;
     count.textContent = `${pageCandidates.length} shown · ${state.uniqueFound} unique`;
     status.innerHTML = `
-      <span>Total images found: <strong>${state.totalFound}</strong></span>
-      <span>Unique images found: <strong>${state.uniqueFound}</strong></span>
+      <span>Total media found: <strong>${state.totalFound}</strong></span>
+      <span>Unique media found: <strong>${state.uniqueFound}</strong></span>
       <span>Displayed after filters: <strong>${pageCandidates.length}</strong></span>
       <span>Selected: <strong>${state.selectedUrls.size}</strong></span>
       <span>Current mode: <strong>${state.advancedMode ? ADVANCED_MODE : SAFE_MODE}</strong></span>
       <span>APIs: XHR ${api.xhr ? 'yes' : 'no'} · Download ${api.download ? 'yes' : 'no'} · Clipboard ${api.setClipboard ? 'yes' : 'no'}</span>
       ${state.isChecking ? '<span>Checking HD guesses…</span>' : ''}
     `;
-    list.innerHTML = candidates.length ? candidates.map(renderCandidateRow).join('') : '<li>No images found yet. Tap Scan page.</li>';
+    list.innerHTML = candidates.length ? candidates.map(renderCandidateRow).join('') : '<li>No media found yet. Tap Scan page.</li>';
     list.hidden = !forceOpen && !candidates.length;
   }
 
   function renderCandidateRow(candidate, index) {
     const checked = state.selectedUrls.has(candidate.url) ? 'checked' : '';
     const dimensions = dimensionLabel(candidate);
-    const confidenceLabel = CONFIDENCE_LABELS[candidate.confidence || CONFIDENCE.PAGE_LINK] || 'POSSIBLE_IMAGE';
+    const confidenceLabel = CONFIDENCE_LABELS[candidate.confidence || CONFIDENCE.PAGE_LINK] || 'POSSIBLE_MEDIA';
     const badges = `${candidate.kind === 'guess' ? '<b class="imu-iphone-compat-badge">HD guessed</b>' : ''}${candidate.checked && candidate.ok ? '<b class="imu-iphone-compat-badge imu-iphone-compat-verified">Verified</b>' : ''}<b class="imu-iphone-compat-badge imu-iphone-compat-confidence">${confidenceLabel}</b>`;
     return `
       <li class="${PATCH_ID}-result">
         <label class="${PATCH_ID}-pick"><input type="checkbox" data-select-url="${escapeAttribute(candidate.url)}" ${checked}></label>
-        <button type="button" class="${PATCH_ID}-thumb" data-row-action="preview" data-url="${escapeAttribute(candidate.url)}" aria-label="Open preview"><img src="${escapeAttribute(candidate.thumb || candidate.url)}" alt="" loading="lazy" referrerpolicy="no-referrer"></button>
+        <button type="button" class="${PATCH_ID}-thumb" data-row-action="preview" data-url="${escapeAttribute(candidate.url)}" aria-label="Open preview">${renderCandidateThumb(candidate)}</button>
         <div class="${PATCH_ID}-meta">
           <strong>${index + 1}. ${escapeHtml(shortUrl(candidate.url))} ${badges}</strong>
-          <span>Source: ${escapeHtml(candidate.source || 'page URL')} · Type: ${escapeHtml(candidate.mediaType || 'image')} · ${dimensions}</span>
+          <span>Source: ${escapeHtml(candidate.source || 'page URL')} · Type: ${escapeHtml(candidate.mediaType || 'media')} · ${dimensions}</span>
           <small>${escapeHtml(candidate.url)}</small>
           <details class="${PATCH_ID}-debug"><summary>Debug score ${Math.round(effectiveScore(candidate))}</summary><small>Matched: ${escapeHtml((candidate.rules || []).join(', ') || 'none')}<br>Reason: ${escapeHtml(candidate.debugReason || 'No debug reason')}<br>Advanced verified: ${candidate.checked && candidate.ok ? 'yes' : 'no'}${candidate.contentLength ? `<br>HEAD content-length: ${candidate.contentLength}` : ''}</small></details>
           <div class="${PATCH_ID}-row-actions">
@@ -1041,6 +1291,12 @@
         </div>
       </li>
     `;
+  }
+
+
+  function renderCandidateThumb(candidate) {
+    if (isVideoCandidate(candidate)) return `<span class="${PATCH_ID}-video-thumb" aria-hidden="true">▶</span>`;
+    return `<img src="${escapeAttribute(candidate.thumb || candidate.url)}" alt="" loading="lazy" referrerpolicy="no-referrer">`;
   }
 
   function dimensionLabel(candidate) {
@@ -1059,18 +1315,18 @@
   function selectAllVisible() {
     ensureScan().forEach((candidate) => state.selectedUrls.add(candidate.url));
     renderControlCenterList(true);
-    showMessage('Selected all filtered images');
+    showMessage('Selected all filtered media');
   }
 
   function copySelectedUrls() {
     const urls = ensureScan().filter((candidate) => state.selectedUrls.has(candidate.url)).map((candidate) => candidate.url);
-    if (!urls.length) return showMessage('Select images first.');
+    if (!urls.length) return showMessage('Select media first.');
     return copyNormally(urls.join('\n'));
   }
 
   function exportUrlsAsText() {
     const text = ensureScan().map((candidate) => candidate.url).join('\n');
-    if (!text) return showMessage('No image URLs found.');
+    if (!text) return showMessage('No media URLs found.');
     const blob = new Blob([text], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     browserDownloadOrOpen(url);
@@ -1079,7 +1335,21 @@
 
   function openFullscreenPreview(url) {
     ensureFullscreenPreview();
-    fullscreenPreview.querySelector('img').src = url;
+    const image = fullscreenPreview.querySelector('img');
+    const video = fullscreenPreview.querySelector('video');
+    if (isVideoCandidate(url)) {
+      image.hidden = true;
+      image.removeAttribute('src');
+      video.hidden = false;
+      video.src = url;
+      video.load();
+    } else {
+      video.hidden = true;
+      video.pause();
+      video.removeAttribute('src');
+      image.hidden = false;
+      image.src = url;
+    }
     fullscreenPreview.querySelector('small').textContent = url;
     fullscreenPreview.hidden = false;
     fullscreenPreview.classList.add(`${PATCH_ID}-preview-open`);
@@ -1093,7 +1363,8 @@
     fullscreenPreview.innerHTML = `
       <div class="${PATCH_ID}-preview-card">
         <button type="button" data-preview-close aria-label="Close preview">×</button>
-        <img alt="Fullscreen image preview">
+        <img alt="Fullscreen media preview">
+        <video controls playsinline preload="metadata" hidden></video>
         <small></small>
       </div>
     `;
@@ -1112,6 +1383,8 @@
 
   function closeFullscreenPreview() {
     if (!fullscreenPreview) return;
+    const video = fullscreenPreview.querySelector('video');
+    video?.pause?.();
     fullscreenPreview.classList.remove(`${PATCH_ID}-preview-open`);
     window.setTimeout(() => { fullscreenPreview.hidden = true; }, 160);
   }
@@ -1130,9 +1403,12 @@
     list.hidden = false;
     list.innerHTML = `
       <li>Drag the IMU bubble anywhere comfortable; tap it to open this control center.</li>
-      <li>Use filters for JPG/PNG/WebP, duplicates, and large images; sort by size, filename length, or source confidence.</li>
+      <li>Use filters for JPG/PNG/WebP, duplicates, and large media; sort by size, filename length, or source confidence.</li>
       <li>Tap a thumbnail or Fullscreen to preview without leaving the page. Swipe down to close the preview.</li>
-      <li>Select rows, then use Open selected, Copy selected URLs, or Export URLs as text.</li>
+      <li>Select rows, then use Open selected, Copy selected URLs, Copy video URLs, or Export URLs as text.</li>
+      <li>Click/tap play and this script rescans shortly after, which helps reveal hidden <code>video.currentSrc</code> and HLS/DASH playlist URLs.</li>
+      <li>Blob/MediaSource videos may only expose a temporary object URL here; the real media segments may need to be captured from the browser Network tab instead of directly downloaded.</li>
+      <li>Only download videos that you own or have permission to save.</li>
     `;
   }
 
@@ -1198,7 +1474,7 @@
         position: fixed !important; z-index: 2147483647 !important;
         left: max(12px, env(safe-area-inset-left)) !important; right: max(12px, env(safe-area-inset-right)) !important;
         bottom: max(12px, env(safe-area-inset-bottom)) !important; display: grid !important;
-        grid-template-columns: 1fr auto auto auto auto !important; gap: 8px !important; align-items: center !important;
+        grid-template-columns: minmax(0, 1fr) repeat(6, auto) !important; gap: 8px !important; align-items: center !important;
         padding: 10px !important; border-radius: 14px !important; background: rgba(17, 24, 39, 0.96) !important;
         color: #fff !important; box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35) !important;
         font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
@@ -1206,7 +1482,7 @@
       #${PATCH_ID}-bar[hidden], #${PATCH_ID}-float[hidden], #${PATCH_ID}-center[hidden] { display: none !important; }
       #${PATCH_ID}-title { min-width: 0 !important; overflow: hidden !important; text-overflow: ellipsis !important; white-space: nowrap !important; }
       #${PATCH_ID}-bar button, #${PATCH_ID}-float, #${PATCH_ID}-center button {
-        appearance: none !important; border: 0 !important; border-radius: 999px !important; padding: 9px 12px !important;
+        appearance: none !important; border: 0 !important; border-radius: 999px !important; padding: 11px 14px !important; min-height: 44px !important; touch-action: manipulation !important;
         background: #2563eb !important; color: #fff !important; font: 600 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
       }
       #${PATCH_ID}-bar button[data-action="download"], #${PATCH_ID}-bar button[data-action="copy"],
@@ -1214,7 +1490,7 @@
       #${PATCH_ID}-bar button[data-action="close"], #${PATCH_ID}-center button[data-center-action="close"] { background: #111827 !important; font-size: 18px !important; line-height: 1 !important; }
       #${PATCH_ID}-float {
         position: fixed !important; z-index: 2147483646 !important; right: max(12px, env(safe-area-inset-right)) !important;
-        bottom: max(84px, calc(84px + env(safe-area-inset-bottom))) !important; min-width: 54px !important; min-height: 54px !important;
+        bottom: max(92px, calc(92px + env(safe-area-inset-bottom))) !important; min-width: 58px !important; min-height: 58px !important;
         box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35) !important;
       }
       #${PATCH_ID}-center {
@@ -1223,7 +1499,7 @@
         background: rgba(0, 0, 0, 0.35) !important; color: #fff !important; font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
       }
       #${PATCH_ID}-center .${PATCH_ID}-panel {
-        width: min(760px, 100%) !important; max-height: min(86vh, 760px) !important; overflow: auto !important;
+        width: min(760px, 100%) !important; max-height: min(88dvh, 760px) !important; overflow: auto !important; overscroll-behavior: contain !important; -webkit-overflow-scrolling: touch !important;
         border-radius: 18px !important; background: rgba(17, 24, 39, 0.98) !important; box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45) !important; padding: 14px !important;
       }
       #${PATCH_ID}-center header { display: flex !important; justify-content: space-between !important; gap: 12px !important; align-items: start !important; margin-bottom: 12px !important; }
@@ -1237,7 +1513,8 @@
         display: grid !important; grid-template-columns: auto 64px 1fr !important; gap: 10px !important; align-items: start !important;
         padding: 10px 0 !important; border-top: 1px solid rgba(148, 163, 184, 0.25) !important; color: #e5e7eb !important;
       }
-      #${PATCH_ID}-list img { width: 64px !important; height: 64px !important; object-fit: cover !important; border-radius: 10px !important; background: #111827 !important; }
+      #${PATCH_ID}-list img, #${PATCH_ID}-list .${PATCH_ID}-video-thumb { width: 64px !important; height: 64px !important; object-fit: cover !important; border-radius: 10px !important; background: #111827 !important; }
+      #${PATCH_ID}-list .${PATCH_ID}-video-thumb { display: grid !important; place-items: center !important; color: #fff !important; font-size: 26px !important; box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.35) !important; }
       #${PATCH_ID}-list .${PATCH_ID}-meta { min-width: 0 !important; display: grid !important; gap: 4px !important; }
       #${PATCH_ID}-list .${PATCH_ID}-meta strong, #${PATCH_ID}-list .${PATCH_ID}-meta small, #${PATCH_ID}-list .${PATCH_ID}-meta span { overflow-wrap: anywhere !important; }
       #${PATCH_ID}-list .${PATCH_ID}-row-actions { display: flex !important; flex-wrap: wrap !important; gap: 6px !important; margin-top: 4px !important; }
@@ -1284,13 +1561,19 @@
       }
       #${PATCH_ID}-preview.${PATCH_ID}-preview-open { opacity: 1 !important; }
       #${PATCH_ID}-preview .${PATCH_ID}-preview-card { width: 100% !important; height: 100% !important; display: grid !important; grid-template-rows: auto 1fr auto !important; gap: 8px !important; }
-      #${PATCH_ID}-preview img { max-width: 100% !important; max-height: 100% !important; width: 100% !important; height: 100% !important; object-fit: contain !important; }
+      #${PATCH_ID}-preview img, #${PATCH_ID}-preview video { max-width: 100% !important; max-height: 100% !important; width: 100% !important; height: 100% !important; object-fit: contain !important; }
       #${PATCH_ID}-preview small { color: #e5e7eb !important; overflow-wrap: anywhere !important; font-size: 12px !important; }
       #${PATCH_ID}-preview button { justify-self: end !important; width: 44px !important; height: 44px !important; border-radius: 999px !important; border: 0 !important; background: rgba(17, 24, 39, 0.9) !important; color: #fff !important; font-size: 24px !important; }
       #${PATCH_ID}-highlight { position: absolute !important; z-index: 2147483646 !important; pointer-events: none !important; border: 3px solid #2563eb !important; border-radius: 8px !important; box-shadow: 0 0 0 9999px rgba(37, 99, 235, 0.10) !important; display: none; }
       @media (max-width: 430px) {
-        #${PATCH_ID}-bar { grid-template-columns: 1fr auto auto !important; overflow-x: auto !important; }
-        #${PATCH_ID}-status { grid-template-columns: 1fr !important; }
+        #${PATCH_ID}-bar { grid-template-columns: repeat(6, max-content) !important; overflow-x: auto !important; padding-bottom: max(10px, env(safe-area-inset-bottom)) !important; }
+        #${PATCH_ID}-title { grid-column: 1 / -1 !important; }
+        #${PATCH_ID}-center { place-items: end stretch !important; padding-left: 0 !important; padding-right: 0 !important; padding-bottom: 0 !important; }
+        #${PATCH_ID}-center .${PATCH_ID}-panel { width: 100% !important; max-height: 92dvh !important; border-radius: 22px 22px 0 0 !important; padding: 16px max(14px, env(safe-area-inset-right)) max(18px, env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left)) !important; }
+        #${PATCH_ID}-status, #${PATCH_ID}-center .${PATCH_ID}-filters, #${PATCH_ID}-center .${PATCH_ID}-actions { grid-template-columns: 1fr !important; }
+        #${PATCH_ID}-list .${PATCH_ID}-result { grid-template-columns: auto 56px minmax(0, 1fr) !important; gap: 8px !important; }
+        #${PATCH_ID}-list img, #${PATCH_ID}-list .${PATCH_ID}-video-thumb { width: 56px !important; height: 56px !important; }
+        #${PATCH_ID}-list .${PATCH_ID}-row-actions { display: grid !important; grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
       }
     `;
     document.documentElement.appendChild(style);
