@@ -1,0 +1,1298 @@
+// ==UserScript==
+// @name         Image Max URL - iPhone Compatibility Mode
+// @namespace    https://littlelooney.example/image-max-url-iphone
+// @version      2026-05-13.4
+// @description  iPhone/Safari companion for Image Max URL: menu commands, a touch control center, safe page scanning, optional advanced API checks, HD URL guesses, filtering, sorting, and fullscreen preview.
+// @author       LittleLooney + OpenAI
+// @license      Apache-2.0
+// @match        *://*/*
+// @grant        GM_registerMenuCommand
+// @grant        GM_xmlhttpRequest
+// @grant        GM.xmlHttpRequest
+// @grant        GM_download
+// @grant        GM_setClipboard
+// @grant        GM.setClipboard
+// @connect      *
+// @run-at       document-idle
+// @downloadURL https://update.greasyfork.org/scripts/578872/Image%20Max%20URL%20-%20iPhone%20Compatibility%20Mode.user.js
+// @updateURL https://update.greasyfork.org/scripts/578872/Image%20Max%20URL%20-%20iPhone%20Compatibility%20Mode.meta.js
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  /**
+   * Image Max URL iPhone companion script.
+   *
+   * This intentionally remains a separate iPhone-safe companion instead of editing or
+   * rewriting the large/minified av4.js Image Max URL file. The default mode is Safe
+   * iPhone Mode: it only uses URLs already present in the page and avoids
+   * GM_xmlhttpRequest, GM_download, @require, and cross-origin probing. Advanced Mode
+   * is opt-in from the in-page control center and only uses GM APIs after detecting
+   * that the current iOS userscript manager actually exposes them.
+   */
+
+  const PATCH_ID = 'imu-iphone-compat';
+  const LONG_PRESS_MS = 650;
+  const MAX_ANCESTOR_DEPTH = 5;
+  const MAX_BACKGROUND_SCAN_NODES = 2500;
+  const MAX_ADVANCED_HEAD_CHECKS = 30;
+  const IMAGE_EXT_RE = /\.(?:avif|bmp|gif|heic|heif|jpe?g|jxl|png|svg|webp)(?:[?#].*)?$/i;
+  const SIZE_HINT_RE = /(?:^|[?&_/.-])(?:w|width|h|height|size|s|dpr|quality|q)[=:_-]?(\d{2,5})/ig;
+  const STRIP_QUERY_PARAMS = new Set(['w', 'width', 'h', 'height', 'fit', 'crop', 'resize', 'quality', 'q']);
+  const SAFE_MODE = 'Safe iPhone Mode';
+  const ADVANCED_MODE = 'Advanced Mode';
+  const CONFIDENCE = Object.freeze({ VERIFIED_IMAGE: 5, LIKELY_IMAGE: 4, POSSIBLE_IMAGE: 3, POSSIBLE_IMAGE_PAGE: 2, PAGE_LINK: 1 });
+  const CONFIDENCE_LABELS = Object.freeze({ 5: 'VERIFIED_IMAGE', 4: 'LIKELY_IMAGE', 3: 'POSSIBLE_IMAGE', 2: 'POSSIBLE_IMAGE_PAGE', 1: 'PAGE_LINK' });
+  const KNOWN_IMAGE_CDNS = ['i.redd.it', 'preview.redd.it', 'external-preview.redd.it', 'i.imgur.com', 'imgur.com', 'images.unsplash.com', 'images.pexels.com', 'pbs.twimg.com', 'media.tenor.com', 'media.giphy.com', 'cdn.discordapp.com', 'staticflickr.com', 'wikimedia.org'];
+  const CATEGORY_PAGE_RE = /\/(?:search|collections?|topics?|r|user|profile|tag)(?:\/|$|[?#])/i;
+
+  const api = detectApis();
+  const isTouchDevice = matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window;
+  const state = {
+    advancedMode: false,
+    selectedUrls: new Set(),
+    totalFound: 0,
+    uniqueFound: 0,
+    isChecking: false,
+    filterType: 'all',
+    hideDuplicates: true,
+    largeOnly: false,
+    sortBy: 'size',
+    verifiedOnly: false,
+    likelyOnly: true,
+    includePageLinks: false,
+    visibleCount: 40,
+    panelCollapsed: false,
+  };
+
+  let pressTimer = 0;
+  let pressPoint = null;
+  let selected = null;
+  let bar = null;
+  let highlight = null;
+  let floatingButton = null;
+  let controlCenter = null;
+  let fullscreenPreview = null;
+  let rawCandidates = [];
+  let pageCandidates = [];
+  let scanDebounceTimer = 0;
+  let dragState = null;
+  let previewTouchStart = null;
+  let lastScanAt = 0;
+
+  // ---------- Bootstrap and menu commands ----------
+  injectStyles();
+  createActionBar();
+  createFloatingButton(true);
+  registerMenuCommands();
+  if (isTouchDevice) installTouchHandlers();
+
+  function detectApis() {
+    return {
+      menuCommand: typeof GM_registerMenuCommand === 'function' ? GM_registerMenuCommand : null,
+      xhr: typeof GM_xmlhttpRequest === 'function'
+        ? GM_xmlhttpRequest
+        : (typeof GM !== 'undefined' && typeof GM.xmlHttpRequest === 'function' ? GM.xmlHttpRequest.bind(GM) : null),
+      download: typeof GM_download === 'function' ? GM_download : null,
+      setClipboard: typeof GM_setClipboard === 'function'
+        ? GM_setClipboard
+        : (typeof GM !== 'undefined' && typeof GM.setClipboard === 'function' ? GM.setClipboard.bind(GM) : null),
+    };
+  }
+
+  function registerMenuCommands() {
+    if (!api.menuCommand) return;
+    safeRegisterMenuCommand('Scan images', () => scanPage(true));
+    safeRegisterMenuCommand('Open control center', () => openControlCenter());
+    safeRegisterMenuCommand('Copy top image URL', () => copyTopImageUrl());
+    safeRegisterMenuCommand('Open top image', () => openTopImage());
+    safeRegisterMenuCommand('Toggle floating button', () => toggleFloatingButton());
+    safeRegisterMenuCommand('Help / About', () => openHelpAbout());
+  }
+
+  function safeRegisterMenuCommand(label, callback) {
+    try {
+      api.menuCommand(label, callback);
+    } catch (error) {
+      console.warn(`[${PATCH_ID}] Could not register menu command: ${label}`, error);
+      createFloatingButton(true);
+    }
+  }
+
+  // ---------- Touch selection: long-press image, then show bottom action bar ----------
+  function installTouchHandlers() {
+    document.addEventListener('touchstart', onTouchStart, { capture: true, passive: true });
+    document.addEventListener('touchmove', onTouchMove, { capture: true, passive: true });
+    document.addEventListener('touchend', clearPressTimer, { capture: true, passive: true });
+    document.addEventListener('touchcancel', clearPressTimer, { capture: true, passive: true });
+    document.addEventListener('pointerdown', onPointerDown, { capture: true, passive: true });
+    document.addEventListener('pointerup', clearPressTimer, { capture: true, passive: true });
+    document.addEventListener('pointercancel', clearPressTimer, { capture: true, passive: true });
+  }
+
+  function onTouchStart(event) {
+    if (!event.touches || event.touches.length !== 1) return;
+    const touch = event.touches[0];
+    scheduleSelection(event, touch.clientX, touch.clientY);
+  }
+
+  function onTouchMove(event) {
+    if (!pressPoint || !event.touches || event.touches.length !== 1) return;
+    const touch = event.touches[0];
+    const distance = Math.hypot(touch.clientX - pressPoint.x, touch.clientY - pressPoint.y);
+    if (distance > 12) clearPressTimer();
+  }
+
+  function onPointerDown(event) {
+    if (event.pointerType === 'mouse' || event.button !== 0) return;
+    scheduleSelection(event, event.clientX, event.clientY);
+  }
+
+  function scheduleSelection(event, x, y) {
+    clearPressTimer();
+    pressPoint = { x, y };
+    const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+    pressTimer = window.setTimeout(() => selectFromPoint(x, y, path), LONG_PRESS_MS);
+  }
+
+  function clearPressTimer() {
+    window.clearTimeout(pressTimer);
+    pressTimer = 0;
+    pressPoint = null;
+  }
+
+  function selectFromPoint(x, y, eventPath) {
+    clearPressTimer();
+    const element = findMediaElement(eventPath) || findMediaElement([document.elementFromPoint(x, y)]);
+    if (!element) return;
+    const result = getBestImageForElement(element);
+    if (!result?.url) return showMessage('No image URL found here');
+    selected = result;
+    state.selectedUrls.add(result.url);
+    showHighlight(element);
+    renderActionBar(result);
+    renderControlCenterList();
+  }
+
+  // ---------- Safe page scanner: only reads URLs already present in DOM/CSS ----------
+  function scanPage(announce = false) {
+    const candidates = [];
+    const selector = [
+      'img', 'picture', 'source[srcset]', 'video[poster]', 'a[href]', '[style*="background"]',
+      '[data-src]', '[data-original]', '[data-full]', '[data-fullsrc]', '[data-large]', '[data-image]', '[data-url]',
+    ].join(',');
+
+    document.querySelectorAll(selector).forEach((element) => collectElementCandidates(element, candidates));
+
+    // Computed background scans are capped to keep Safari responsive on huge pages.
+    [...(document.body || document.documentElement).querySelectorAll('*')]
+      .slice(0, MAX_BACKGROUND_SCAN_NODES)
+      .forEach((element) => {
+        getBackgroundImageUrls(element).forEach((url) => addCandidate(candidates, url, scoreUrl(url) + 10, element, 'background image'));
+      });
+
+    state.totalFound = candidates.length;
+    rawCandidates = chooseLargestCandidates(dedupeByUrl(candidates));
+    state.uniqueFound = dedupeCandidates(candidates).length;
+    pageCandidates = getDisplayCandidates();
+    state.visibleCount = Math.min(Math.max(state.visibleCount, 40), Math.max(pageCandidates.length, 40));
+    lastScanAt = Date.now();
+    if (pageCandidates[0] && !selected?.url) selected = pageCandidates[0];
+    if (announce) showMessage(`Scanned ${state.uniqueFound} unique image URL${state.uniqueFound === 1 ? '' : 's'}`);
+    renderControlCenterList();
+    return pageCandidates;
+  }
+
+  function debounceScan(announce = false) {
+    window.clearTimeout(scanDebounceTimer);
+    scanDebounceTimer = window.setTimeout(() => scanPage(announce), 250);
+  }
+
+  function ensureScan() {
+    if (!lastScanAt || Date.now() - lastScanAt > 15000) scanPage(false);
+    return pageCandidates;
+  }
+
+  function findMediaElement(path) {
+    for (const item of path || []) {
+      if (!(item instanceof Element)) continue;
+      if (isMediaCandidate(item)) return item;
+      const nested = item.querySelector?.('img, picture, source[srcset], video[poster], [style*="background"]');
+      if (nested && isMediaCandidate(nested)) return nested;
+    }
+    return null;
+  }
+
+  function isMediaCandidate(element) {
+    if (!element || !(element instanceof Element)) return false;
+    if (element.matches('img, picture, source[srcset], video[poster]')) return true;
+    return Boolean(getBackgroundImageUrls(element).length);
+  }
+
+  function getBestImageForElement(element) {
+    const candidates = [];
+    let current = element;
+    let depth = 0;
+    while (current && current instanceof Element && depth <= MAX_ANCESTOR_DEPTH) {
+      collectElementCandidates(current, candidates);
+      current = current.parentElement;
+      depth += 1;
+    }
+    return chooseLargestCandidate(dedupeCandidates(candidates));
+  }
+
+  function collectElementCandidates(element, candidates) {
+    if (!(element instanceof Element)) return;
+
+    if (element instanceof HTMLImageElement) {
+      addCandidate(candidates, element.currentSrc, scoreFromElement(element, 'currentSrc'), element, 'img currentSrc');
+      addCandidate(candidates, element.src, scoreFromElement(element, 'src'), element, 'img src');
+      collectSrcset(element.getAttribute('srcset'), candidates, element, 'img srcset');
+      collectAttributes(element, candidates, ['data-src', 'data-original', 'data-full', 'data-fullsrc', 'data-large', 'data-url']);
+    }
+
+    if (element instanceof HTMLPictureElement) {
+      element.querySelectorAll('source[srcset], img').forEach((child) => collectElementCandidates(child, candidates));
+    }
+
+    if (element instanceof HTMLSourceElement) collectSrcset(element.getAttribute('srcset'), candidates, element, 'source srcset');
+    if (element instanceof HTMLVideoElement) addCandidate(candidates, element.poster, scoreUrl(element.poster) + 20, element, 'video poster');
+    if (element instanceof HTMLAnchorElement) addCandidate(candidates, element.href, scoreUrl(element.href) + (IMAGE_EXT_RE.test(element.href) ? 40 : 0), element, 'anchor link');
+
+    collectAttributes(element, candidates, ['src', 'poster', 'data-src', 'data-original', 'data-full', 'data-fullsrc', 'data-large', 'data-image', 'data-url']);
+    getBackgroundImageUrls(element).forEach((url) => addCandidate(candidates, url, scoreUrl(url) + 10, element, 'background image'));
+  }
+
+  function collectAttributes(element, candidates, names) {
+    names.forEach((name) => {
+      if (element.hasAttribute(name)) addCandidate(candidates, element.getAttribute(name), scoreUrl(element.getAttribute(name)), element, name);
+    });
+  }
+
+  function collectSrcset(srcset, candidates, element, source) {
+    parseSrcset(srcset).forEach((item) => addCandidate(candidates, item.url, item.score + scoreUrl(item.url), element, source));
+  }
+
+  function addCandidate(candidates, rawUrl, score = 0, element = null, source = 'page URL') {
+    const url = normalizeUrl(rawUrl);
+    if (!url || url.startsWith('data:') || url.startsWith('blob:')) return;
+    const analysis = analyzeCandidate(url, element, source, score);
+    if (analysis.reject) return;
+    const dimensions = getCandidateDimensions(element, url);
+    candidates.push({
+      url,
+      originalUrl: url,
+      score: analysis.score,
+      element,
+      source,
+      kind: 'page',
+      checked: false,
+      ok: true,
+      thumb: url,
+      width: dimensions.width,
+      height: dimensions.height,
+      contentLength: 0,
+      confidence: analysis.confidence,
+      mediaType: analysis.mediaType,
+      rules: analysis.rules,
+      debugReason: analysis.reason,
+      canonicalKey: canonicalImageKey(url),
+    });
+  }
+
+  function analyzeCandidate(url, element, source, baseScore) {
+    const rules = [];
+    const parsed = safeUrl(url);
+    const sourceText = String(source || '');
+    const path = `${parsed?.pathname || ''}${parsed?.search || ''}`.toLowerCase();
+    const host = parsed?.hostname.replace(/^www\./, '').toLowerCase() || '';
+    const isAnchor = element instanceof HTMLAnchorElement && sourceText === 'anchor link';
+    const containsMedia = Boolean(element?.querySelector?.('img, picture, video[poster], source[srcset]'));
+    let score = Number(baseScore || 0);
+    let confidence = CONFIDENCE.POSSIBLE_IMAGE;
+    let mediaType = 'image';
+
+    const hasImageExtension = IMAGE_EXT_RE.test(url);
+    const isKnownImageCdn = KNOWN_IMAGE_CDNS.some((cdn) => host === cdn || host.endsWith(`.${cdn}`));
+    const isCategoryPage = isCategoryPageUrl(parsed, path);
+
+    if (hasImageExtension) { rules.push('known image extension'); score += 80; confidence = CONFIDENCE.LIKELY_IMAGE; }
+    if (/\.(?:gif)(?:[?#]|$)/i.test(url)) mediaType = 'gif';
+    if (sourceText.includes('poster')) { rules.push('video poster source'); mediaType = 'video poster'; score += 60; confidence = Math.max(confidence, CONFIDENCE.LIKELY_IMAGE); }
+    if (sourceText.includes('background')) { rules.push('background image source'); mediaType = 'background image'; score += 45; confidence = Math.max(confidence, CONFIDENCE.LIKELY_IMAGE); }
+    if (sourceText.includes('srcset')) { rules.push('srcset/image attribute'); score += 90; confidence = CONFIDENCE.LIKELY_IMAGE; }
+    if (/data-(?:src|original|full|fullsrc|large|image|url)/.test(sourceText)) { rules.push('image-related data attribute'); score += 50; confidence = Math.max(confidence, CONFIDENCE.LIKELY_IMAGE); }
+    if (isKnownImageCdn) { rules.push('known image CDN'); score += 75; confidence = Math.max(confidence, CONFIDENCE.LIKELY_IMAGE); }
+    if (/(?:image|img|photo|picture|media|thumbnail|thumb|preview|gallery|album|cdn|uploads?)/i.test(path)) { rules.push('image-related URL path'); score += 35; confidence = Math.max(confidence, CONFIDENCE.POSSIBLE_IMAGE); }
+    if (/(?:gallery|album)/i.test(path)) { mediaType = 'gallery image'; rules.push('gallery pattern'); score += 20; }
+    if (containsMedia) {
+      rules.push('anchor contains media element');
+      score += 70;
+      confidence = Math.max(confidence, isAnchor && isCategoryPage && !hasImageExtension && !isKnownImageCdn ? CONFIDENCE.POSSIBLE_IMAGE_PAGE : CONFIDENCE.LIKELY_IMAGE);
+    }
+    if (isAnchor && isCategoryPage && !hasImageExtension && !isKnownImageCdn) {
+      rules.push('category/search/profile page URL');
+      confidence = Math.min(confidence, CONFIDENCE.POSSIBLE_IMAGE_PAGE);
+      mediaType = mediaType === 'image' ? 'page link' : mediaType;
+    }
+
+    const navPenalty = navigationPenalty(parsed, path);
+    if (navPenalty) {
+      rules.push(navPenalty.reason);
+      score -= navPenalty.penalty;
+    }
+
+    if (isAnchor) {
+      const anchorQualifies = rules.some((rule) => ['known image extension', 'known image CDN', 'image-related URL path', 'srcset/image attribute', 'anchor contains media element', 'gallery pattern'].includes(rule)) || score >= 180;
+      if (!anchorQualifies) {
+        return { reject: true, score, confidence: CONFIDENCE.PAGE_LINK, mediaType: 'page link', rules: rules.concat('rejected generic anchor'), reason: 'Rejected anchor link: no image extension/CDN/path/media child/high score.' };
+      }
+      if (navPenalty && confidence < CONFIDENCE.POSSIBLE_IMAGE_PAGE) {
+        return { reject: true, score, confidence: CONFIDENCE.PAGE_LINK, mediaType: 'page link', rules: rules.concat('rejected navigation anchor'), reason: `Rejected navigation/profile/comment link (${navPenalty.reason}).` };
+      }
+      if (confidence < CONFIDENCE.LIKELY_IMAGE && confidence !== CONFIDENCE.POSSIBLE_IMAGE_PAGE) confidence = CONFIDENCE.PAGE_LINK;
+    }
+
+    if (score < -20 && confidence <= CONFIDENCE.POSSIBLE_IMAGE) return { reject: true, score, confidence: CONFIDENCE.PAGE_LINK, mediaType: 'page link', rules, reason: 'Rejected low-score page/navigation URL.' };
+    return { reject: false, score, confidence, mediaType, rules, reason: rules.join(', ') || 'weak page URL signal' };
+  }
+
+  function safeUrl(url) {
+    try { return new URL(url, location.href); } catch { return null; }
+  }
+
+  function isCategoryPageUrl(parsed, path) {
+    if (!parsed) return false;
+    return CATEGORY_PAGE_RE.test(path);
+  }
+
+  function navigationPenalty(parsed, path) {
+    if (!parsed) return null;
+    const host = parsed.hostname.replace(/^www\./, '').toLowerCase();
+    if (/reddit\.com$/.test(host)) {
+      if (/^\/r\/[^/]+\/?(?:$|[?#])/.test(path)) return { penalty: 220, reason: 'reddit subreddit navigation' };
+      if (/^\/(?:rules|answers)(?:\/|$|[?#])/.test(path)) return { penalty: 240, reason: 'reddit rules/answers navigation' };
+      if (/\/comments\//.test(path)) return { penalty: 190, reason: 'reddit comment page' };
+      if (/^\/user\//.test(path)) return { penalty: 180, reason: 'reddit profile link' };
+    }
+    if (/\/(?:profile|user|users|account|login|signup|settings|comments?|rules|answers|about|help|privacy|terms)(?:\/|$|[?#])/.test(path)) return { penalty: 140, reason: 'generic page/navigation link' };
+    if (!IMAGE_EXT_RE.test(path) && /\/(?:r|u|user|comments?|posts?)\//.test(path)) return { penalty: 100, reason: 'profile/comment/navigation pattern' };
+    return null;
+  }
+
+  function getCandidateDimensions(element, url) {
+    const width = Number(element?.naturalWidth || element?.videoWidth || element?.width || 0) || parseDimensionHint(url, ['w', 'width']);
+    const height = Number(element?.naturalHeight || element?.videoHeight || element?.height || 0) || parseDimensionHint(url, ['h', 'height']);
+    return { width, height };
+  }
+
+  function parseDimensionHint(url, names) {
+    try {
+      const parsed = new URL(url, location.href);
+      for (const name of names) {
+        const value = Number(parsed.searchParams.get(name));
+        if (value) return value;
+      }
+    } catch {
+      // Ignore malformed hints; this function is only a display heuristic.
+    }
+    return 0;
+  }
+
+  function normalizeUrl(rawUrl) {
+    const value = String(rawUrl || '').trim();
+    if (!value || value === 'null' || value === 'undefined') return '';
+    try {
+      return new URL(value, location.href).href;
+    } catch {
+      return '';
+    }
+  }
+
+  function parseSrcset(srcset) {
+    return String(srcset || '').split(',').map((part) => part.trim()).filter(Boolean).map((part) => {
+      const pieces = part.split(/\s+/);
+      const url = pieces.shift();
+      const descriptor = pieces.join(' ');
+      const width = /(^|\s)(\d+)w(?:\s|$)/.exec(descriptor)?.[2];
+      const density = /(^|\s)(\d*\.?\d+)x(?:\s|$)/.exec(descriptor)?.[2];
+      return { url, score: Number(width || 0) || Number(density || 0) * 1000 || 0 };
+    });
+  }
+
+  function getBackgroundImageUrls(element) {
+    const values = [];
+    const inline = element.getAttribute('style') || '';
+    const computed = getComputedStyle(element).backgroundImage || '';
+    [inline, computed].forEach((text) => {
+      const regex = /url\((['"]?)(.*?)\1\)/ig;
+      let match;
+      while ((match = regex.exec(text))) values.push(match[2]);
+    });
+    return values;
+  }
+
+  // ---------- Duplicate removal and scoring ----------
+  function canonicalImageKey(url) {
+    try {
+      const parsed = new URL(url, location.href);
+      const host = parsed.hostname.replace(/^www\./, '').toLowerCase();
+      const path = decodeURIComponent(parsed.pathname).toLowerCase();
+
+      const pexels = path.match(/\/photos\/(\d+)\//);
+      if (host.includes('pexels.com') && pexels) return `pexels:${pexels[1]}`;
+
+      const unsplash = path.match(/\/(photo-[^/?#]+)/);
+      if (host.includes('unsplash.com') && unsplash) return `unsplash:${unsplash[1]}`;
+
+      STRIP_QUERY_PARAMS.forEach((name) => parsed.searchParams.delete(name));
+      ['auto', 'cs', 'fm', 'ixid', 'ixlib', 'utm_source', 'utm_medium', 'utm_campaign'].forEach((name) => parsed.searchParams.delete(name));
+      parsed.hash = '';
+      return `${host}${parsed.pathname.replace(/\/(?:small|thumb|thumbnail|preview|lowres|medium)(?=\.|\/|$)/ig, '/image')}${parsed.search}`;
+    } catch {
+      return String(url).replace(/[?&#].*$/, '');
+    }
+  }
+
+  function dedupeCandidates(candidates) {
+    const map = new Map();
+    candidates.forEach((candidate) => {
+      const key = candidate.canonicalKey || canonicalImageKey(candidate.url);
+      const existing = map.get(key);
+      if (!existing) {
+        map.set(key, candidate);
+        return;
+      }
+      const merged = betterCandidate(existing, candidate);
+      merged.source = mergeSourceLabels(existing.source, candidate.source);
+      merged.thumb = existing.thumb || candidate.thumb || merged.url;
+      map.set(key, merged);
+    });
+    return [...map.values()];
+  }
+
+
+  function dedupeByUrl(candidates) {
+    const map = new Map();
+    candidates.forEach((candidate) => {
+      const existing = map.get(candidate.url);
+      if (!existing || effectiveScore(candidate) > effectiveScore(existing)) map.set(candidate.url, candidate);
+    });
+    return [...map.values()];
+  }
+
+  function getDisplayCandidates() {
+    const base = state.hideDuplicates ? dedupeCandidates(rawCandidates) : dedupeByUrl(rawCandidates);
+    return chooseSortedCandidates(base.filter(candidatePassesFilters));
+  }
+
+  function refreshDisplayCandidates() {
+    pageCandidates = getDisplayCandidates();
+    renderControlCenterList();
+  }
+
+  function candidatePassesFilters(candidate) {
+    if (state.verifiedOnly && candidate.confidence !== CONFIDENCE.VERIFIED_IMAGE) return false;
+    if (state.likelyOnly && candidate.confidence < CONFIDENCE.LIKELY_IMAGE) return false;
+    if (!state.includePageLinks && candidate.confidence === CONFIDENCE.PAGE_LINK) return false;
+    if (state.filterType === 'common' && !['jpg', 'png', 'webp'].includes(extensionForUrl(candidate.url))) return false;
+    if (!['all', 'common'].includes(state.filterType) && extensionForUrl(candidate.url) !== state.filterType) return false;
+    if (state.largeOnly && estimatedPixels(candidate) < 700 * 700 && effectiveScore(candidate) < 1200) return false;
+    return true;
+  }
+
+  function chooseSortedCandidates(candidates) {
+    return [...candidates].sort((a, b) => {
+      if (state.sortBy === 'filename') return filenameFromUrl(b.url).length - filenameFromUrl(a.url).length;
+      if (state.sortBy === 'confidence') return sourceConfidence(b) - sourceConfidence(a) || confidenceValue(b) - confidenceValue(a) || effectiveScore(b) - effectiveScore(a);
+      return effectiveScore(b) - effectiveScore(a) || estimatedPixels(b) - estimatedPixels(a) || b.url.length - a.url.length;
+    });
+  }
+
+  function extensionForUrl(url) {
+    try {
+      const parsed = new URL(url, location.href);
+      const hinted = String(parsed.searchParams.get('fm') || parsed.searchParams.get('format') || parsed.searchParams.get('ext') || '').toLowerCase();
+      if (['jpg', 'jpeg'].includes(hinted)) return 'jpg';
+      if (hinted === 'png') return 'png';
+      if (hinted === 'webp') return 'webp';
+      const ext = parsed.pathname.split('.').pop().toLowerCase();
+      if (['jpg', 'jpeg'].includes(ext)) return 'jpg';
+      if (ext === 'png') return 'png';
+      if (ext === 'webp') return 'webp';
+    } catch {
+      // Unknown extension is allowed by the default filter.
+    }
+    return 'other';
+  }
+
+  function estimatedPixels(candidate) {
+    return Number(candidate.width || 0) * Number(candidate.height || 0);
+  }
+
+  function sourceConfidence(candidate) {
+    const source = String(candidate.source || '');
+    if (candidate.checked && candidate.ok) return 100;
+    if (source.includes('srcset')) return 80;
+    if (source.includes('currentSrc') || source.includes('img src')) return 70;
+    if (source.includes('data-') || source.includes('background')) return 55;
+    if (source.includes('anchor')) return 45;
+    return 30;
+  }
+
+  function betterCandidate(a, b) {
+    const aScore = effectiveScore(a);
+    const bScore = effectiveScore(b);
+    if (bScore > aScore) return { ...b, source: a.source };
+    return a;
+  }
+
+  function confidenceValue(candidate) {
+    return Number(candidate.confidence || CONFIDENCE.PAGE_LINK);
+  }
+
+  function effectiveScore(candidate) {
+    const verifiedBonus = candidate.confidence === CONFIDENCE.VERIFIED_IMAGE || (candidate.kind === 'guess' && candidate.ok && candidate.checked) ? 2500 : 0;
+    const pageBonus = candidate.kind === 'page' ? 100 : 0;
+    const lengthBonus = candidate.contentLength ? Math.min(2200, Math.log2(candidate.contentLength) * 90) : 0;
+    return Number(candidate.score || 0) + verifiedBonus + pageBonus + lengthBonus + confidenceValue(candidate) * 60;
+  }
+
+  function mergeSourceLabels(a, b) {
+    return [...new Set(String(a || '').split(', ').concat(String(b || '').split(', ')).filter(Boolean))].join(', ');
+  }
+
+  function chooseLargestCandidate(candidates) {
+    return chooseLargestCandidates(candidates)[0] || null;
+  }
+
+  function chooseLargestCandidates(candidates) {
+    return [...candidates].sort((a, b) => effectiveScore(b) - effectiveScore(a) || b.url.length - a.url.length);
+  }
+
+  function scoreFromElement(element, field) {
+    const urlScore = scoreUrl(element[field]);
+    const rendered = Math.max(element.naturalWidth || element.videoWidth || 0, element.naturalHeight || element.videoHeight || 0);
+    return urlScore + rendered;
+  }
+
+  function scoreUrl(url) {
+    let score = IMAGE_EXT_RE.test(String(url || '')) ? 50 : 0;
+    let match;
+    SIZE_HINT_RE.lastIndex = 0;
+    while ((match = SIZE_HINT_RE.exec(String(url || '')))) score = Math.max(score, Number(match[1]));
+    return score;
+  }
+
+  // ---------- Advanced Mode: optional API use and HD guess verification ----------
+  function toggleAdvancedMode() {
+    state.advancedMode = !state.advancedMode;
+    showMessage(state.advancedMode ? 'Advanced Mode enabled' : 'Safe iPhone Mode enabled');
+    renderControlCenterList();
+    if (state.advancedMode) runAdvancedChecks();
+  }
+
+  function generateHdGuesses(candidate) {
+    const urls = new Set([candidate.url]);
+    try {
+      const parsed = new URL(candidate.url);
+      STRIP_QUERY_PARAMS.forEach((name) => parsed.searchParams.delete(name));
+      urls.add(parsed.href);
+
+      const replacements = ['large', 'original'];
+      replacements.forEach((replacement) => {
+        urls.add(parsed.href.replace(/(?:small|thumb|thumbnail|preview|lowres|medium)/ig, replacement));
+        urls.add(candidate.url.replace(/(?:small|thumb|thumbnail|preview|lowres|medium)/ig, replacement));
+      });
+    } catch {
+      urls.add(candidate.url.replace(/(?:small|thumb|thumbnail|preview|lowres|medium)/ig, 'large'));
+      urls.add(candidate.url.replace(/(?:small|thumb|thumbnail|preview|lowres|medium)/ig, 'original'));
+    }
+
+    return [...urls].filter(Boolean).map((url) => ({
+      ...candidate,
+      url,
+      originalUrl: candidate.url,
+      source: url === candidate.url ? candidate.source : `${candidate.source}, HD guess`,
+      kind: url === candidate.url ? candidate.kind : 'guess',
+      checked: url === candidate.url,
+      ok: url === candidate.url,
+      score: scoreUrl(url) + (url.length > candidate.url.length ? 200 : 0),
+      canonicalKey: canonicalImageKey(url),
+    }));
+  }
+
+  async function runAdvancedChecks() {
+    if (!state.advancedMode || state.isChecking) return;
+    if (!api.xhr) {
+      showMessage('Advanced Mode: GM_xmlhttpRequest unavailable');
+      return renderControlCenterList();
+    }
+
+    state.isChecking = true;
+    renderControlCenterList();
+    const base = ensureScan().slice(0, 20);
+    const pageChecks = base.filter((candidate) => candidate.confidence < CONFIDENCE.VERIFIED_IMAGE).slice(0, 10);
+    const guesses = pageChecks.concat(base.flatMap(generateHdGuesses).filter((candidate) => candidate.kind === 'guess')).slice(0, MAX_ADVANCED_HEAD_CHECKS);
+    const passed = [];
+
+    for (const guess of guesses) {
+      const result = await headCheckImage(guess.url);
+      if (result.ok) passed.push({
+        ...guess,
+        checked: true,
+        ok: true,
+        confidence: CONFIDENCE.VERIFIED_IMAGE,
+        contentLength: result.contentLength,
+        mediaType: result.contentType.includes('gif') ? 'gif' : guess.mediaType,
+        kind: guess.kind || 'page',
+        rules: [...(guess.rules || []), `HEAD verified ${result.contentType || 'image'}`, result.contentLength ? `content-length ${result.contentLength}` : 'no content-length'],
+        debugReason: `${guess.debugReason || ''}; Advanced Mode HEAD verified image content-type`,
+      });
+    }
+
+    rawCandidates = dedupeByUrl(rawCandidates.concat(passed));
+    pageCandidates = getDisplayCandidates();
+    state.uniqueFound = dedupeCandidates(rawCandidates).length;
+    state.isChecking = false;
+    showMessage(`Advanced Mode checked ${guesses.length} HD guess${guesses.length === 1 ? '' : 'es'}`);
+    renderControlCenterList();
+  }
+
+  function headCheckImage(url) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (value) => {
+        if (!settled) {
+          settled = true;
+          resolve(value);
+        }
+      };
+
+      try {
+        api.xhr({
+          method: 'HEAD',
+          url,
+          timeout: 5000,
+          onload: (response) => {
+            const headers = String(response.responseHeaders || '').toLowerCase();
+            const contentType = /content-type:\s*([^\n;]+)/i.exec(headers)?.[1]?.trim() || '';
+            const contentLength = Number(/content-length:\s*(\d+)/i.exec(headers)?.[1] || 0);
+            const ok = response.status >= 200 && response.status < 400 && (contentType.includes('image/') || IMAGE_EXT_RE.test(url));
+            done({ ok, contentType, contentLength });
+          },
+          onerror: () => done({ ok: false, contentType: '', contentLength: 0 }),
+          ontimeout: () => done({ ok: false, contentType: '', contentLength: 0 }),
+        });
+      } catch (error) {
+        console.warn(`[${PATCH_ID}] HEAD check failed`, error);
+        done({ ok: false, contentType: '', contentLength: 0 });
+      }
+    });
+  }
+
+  // ---------- Image actions: open/copy/save with safe fallbacks ----------
+  function getTopCandidate() {
+    return selected?.url ? selected : ensureScan()[0] || null;
+  }
+
+  function copyTopImageUrl() {
+    const top = getTopCandidate();
+    if (!top?.url) return showMessage('No image URL found. Try Scan images.');
+    return copyNormally(top.url);
+  }
+
+  function openTopImage() {
+    const top = getTopCandidate();
+    if (!top?.url) return showMessage('No image URL found. Try Scan images.');
+    return openNormally(top.url);
+  }
+
+  function openSelected() {
+    const selectedCandidates = ensureScan().filter((candidate) => state.selectedUrls.has(candidate.url));
+    if (!selectedCandidates.length) return showMessage('Select images first.');
+    selectedCandidates.forEach((candidate, index) => {
+      if (index === 0) openNormally(candidate.url);
+      else window.setTimeout(() => openNormally(candidate.url), index * 250);
+    });
+    showMessage(`Opening ${selectedCandidates.length} selected image${selectedCandidates.length === 1 ? '' : 's'}; Safari may block extra tabs.`);
+  }
+
+  function copyAllUrls() {
+    const urls = ensureScan().map((candidate) => candidate.url);
+    if (!urls.length) return showMessage('No image URLs found.');
+    return copyNormally(urls.join('\n'));
+  }
+
+  function openNormally(url) {
+    const opened = window.open(url, '_blank', 'noopener,noreferrer');
+    if (!opened) location.href = url;
+  }
+
+  function saveOrOpen(url) {
+    if (state.advancedMode && api.download) {
+      try {
+        const result = api.download({
+          url,
+          name: filenameFromUrl(url),
+          onerror: () => browserDownloadOrOpen(url),
+          ontimeout: () => browserDownloadOrOpen(url),
+        });
+        if (result && typeof result.catch === 'function') result.catch(() => browserDownloadOrOpen(url));
+        return;
+      } catch (error) {
+        console.warn(`[${PATCH_ID}] GM_download failed; using Safari fallback`, error);
+      }
+    }
+    browserDownloadOrOpen(url);
+  }
+
+  function browserDownloadOrOpen(url) {
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.target = '_blank';
+    anchor.rel = 'noopener noreferrer';
+    anchor.download = filenameFromUrl(url);
+    document.documentElement.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  }
+
+  function filenameFromUrl(url) {
+    try {
+      return decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop() || 'image');
+    } catch {
+      return 'image';
+    }
+  }
+
+  async function copyNormally(text) {
+    if (state.advancedMode && api.setClipboard) {
+      try {
+        const result = api.setClipboard(text, 'text');
+        if (result && typeof result.then === 'function') await result;
+        showMessage(text.includes('\n') ? 'Image URLs copied' : 'Image URL copied');
+        return;
+      } catch (error) {
+        console.warn(`[${PATCH_ID}] GM clipboard failed; using browser fallback`, error);
+      }
+    }
+
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('Clipboard API unavailable');
+      await navigator.clipboard.writeText(text);
+      showMessage(text.includes('\n') ? 'Image URLs copied' : 'Image URL copied');
+    } catch {
+      window.prompt('Copy this image URL:', text);
+    }
+  }
+
+  // ---------- UI: bottom action bar, draggable launcher, control center, fullscreen preview ----------
+  function createActionBar() {
+    bar = document.createElement('div');
+    bar.id = `${PATCH_ID}-bar`;
+    bar.hidden = true;
+    bar.innerHTML = `
+      <div id="${PATCH_ID}-title">Image selected</div>
+      <button type="button" data-action="open">Open</button>
+      <button type="button" data-action="download">Save/Open</button>
+      <button type="button" data-action="copy">Copy</button>
+      <button type="button" data-action="preview">Preview</button>
+      <button type="button" data-action="center">Controls</button>
+      <button type="button" data-action="close">×</button>
+    `;
+    bar.addEventListener('click', onBarClick);
+    document.documentElement.appendChild(bar);
+  }
+
+  function renderActionBar(result) {
+    bar.querySelector(`#${PATCH_ID}-title`).textContent = shortUrl(result.url);
+    bar.hidden = false;
+  }
+
+  function onBarClick(event) {
+    const action = event.target?.getAttribute?.('data-action');
+    if (!action) return;
+    if (action === 'close') return hideUI();
+    if (action === 'center') return openControlCenter();
+    if (!selected?.url) return;
+    if (action === 'open') openNormally(selected.url);
+    if (action === 'download') saveOrOpen(selected.url);
+    if (action === 'copy') copyNormally(selected.url);
+    if (action === 'preview') openFullscreenPreview(selected.url);
+  }
+
+  function createFloatingButton(visible) {
+    if (!floatingButton) {
+      floatingButton = document.createElement('button');
+      floatingButton.id = `${PATCH_ID}-float`;
+      floatingButton.type = 'button';
+      floatingButton.textContent = 'IMU';
+      floatingButton.title = 'Image Max URL iPhone controls';
+      floatingButton.addEventListener('click', (event) => {
+        if (dragState?.moved) {
+          event.preventDefault();
+          return;
+        }
+        openControlCenter();
+      });
+      floatingButton.addEventListener('pointerdown', startDragLauncher);
+      document.documentElement.appendChild(floatingButton);
+    }
+    floatingButton.hidden = !visible;
+  }
+
+  function startDragLauncher(event) {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    dragState = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      left: floatingButton.getBoundingClientRect().left,
+      top: floatingButton.getBoundingClientRect().top,
+      moved: false,
+    };
+    floatingButton.setPointerCapture?.(event.pointerId);
+    floatingButton.addEventListener('pointermove', dragLauncher);
+    floatingButton.addEventListener('pointerup', stopDragLauncher, { once: true });
+    floatingButton.addEventListener('pointercancel', stopDragLauncher, { once: true });
+  }
+
+  function dragLauncher(event) {
+    if (!dragState || event.pointerId !== dragState.pointerId) return;
+    const dx = event.clientX - dragState.startX;
+    const dy = event.clientY - dragState.startY;
+    if (Math.hypot(dx, dy) > 8) dragState.moved = true;
+    const left = Math.min(window.innerWidth - 62, Math.max(8, dragState.left + dx));
+    const top = Math.min(window.innerHeight - 62, Math.max(8, dragState.top + dy));
+    Object.assign(floatingButton.style, { left: `${left}px`, top: `${top}px`, right: 'auto', bottom: 'auto' });
+  }
+
+  function stopDragLauncher(event) {
+    if (dragState && event.pointerId === dragState.pointerId) floatingButton.releasePointerCapture?.(event.pointerId);
+    floatingButton.removeEventListener('pointermove', dragLauncher);
+    window.setTimeout(() => { dragState = null; }, 0);
+  }
+
+  function toggleFloatingButton() {
+    createFloatingButton(true);
+    floatingButton.hidden = !floatingButton.hidden;
+    showMessage(floatingButton.hidden ? 'Floating button hidden' : 'Floating button shown');
+  }
+
+  function openControlCenter() {
+    ensureControlCenter();
+    debounceScan(false);
+    controlCenter.hidden = false;
+    controlCenter.classList.remove(`${PATCH_ID}-closing`);
+    controlCenter.classList.add(`${PATCH_ID}-open`);
+    renderControlCenterList(true);
+  }
+
+  function closeControlCenter() {
+    if (!controlCenter) return;
+    controlCenter.classList.add(`${PATCH_ID}-closing`);
+    window.setTimeout(() => {
+      controlCenter.hidden = true;
+      controlCenter.classList.remove(`${PATCH_ID}-open`, `${PATCH_ID}-closing`);
+    }, 180);
+  }
+
+  function togglePanelCollapse() {
+    state.panelCollapsed = !state.panelCollapsed;
+    controlCenter?.classList.toggle(`${PATCH_ID}-collapsed`, state.panelCollapsed);
+  }
+
+  function ensureControlCenter() {
+    if (controlCenter) return;
+    controlCenter = document.createElement('div');
+    controlCenter.id = `${PATCH_ID}-center`;
+    controlCenter.hidden = true;
+    controlCenter.innerHTML = `
+      <div class="${PATCH_ID}-panel" role="dialog" aria-modal="true" aria-label="Image Max URL iPhone control center">
+        <header>
+          <div>
+            <strong>Image Max URL iPhone</strong>
+            <span id="${PATCH_ID}-count">No scan yet</span>
+          </div>
+          <div class="${PATCH_ID}-window-actions">
+            <button type="button" data-center-action="collapse" aria-label="Collapse">–</button>
+            <button type="button" data-center-action="close" aria-label="Close">×</button>
+          </div>
+        </header>
+        <div class="${PATCH_ID}-collapsible">
+          <section id="${PATCH_ID}-status" class="${PATCH_ID}-status"></section>
+          <label class="${PATCH_ID}-advanced"><input type="checkbox" id="${PATCH_ID}-advanced-toggle"> Advanced Mode</label>
+          <div class="${PATCH_ID}-filters">
+            <label>Type <select id="${PATCH_ID}-filter-type"><option value="all">All</option><option value="common">JPG/PNG/WebP only</option><option value="jpg">JPG only</option><option value="png">PNG only</option><option value="webp">WebP only</option></select></label>
+            <label>Sort <select id="${PATCH_ID}-sort"><option value="size">Estimated size</option><option value="filename">Filename length</option><option value="confidence">Source confidence</option></select></label>
+            <label><input type="checkbox" id="${PATCH_ID}-hide-dupes" checked> Hide duplicates</label>
+            <label><input type="checkbox" id="${PATCH_ID}-large-only"> Large only</label>
+            <label><input type="checkbox" id="${PATCH_ID}-verified-only"> Verified only</label>
+            <label><input type="checkbox" id="${PATCH_ID}-likely-only" checked> Likely images only</label>
+            <label><input type="checkbox" id="${PATCH_ID}-include-page-links"> Include page links</label>
+          </div>
+          <div class="${PATCH_ID}-actions">
+            <button type="button" data-center-action="scan">Scan page</button>
+            <button type="button" data-center-action="selectAll">Select all</button>
+            <button type="button" data-center-action="openSelected">Open selected</button>
+            <button type="button" data-center-action="copySelected">Copy selected URLs</button>
+            <button type="button" data-center-action="exportText">Export URLs as text</button>
+            <button type="button" data-center-action="copyAll">Copy all URLs</button>
+            <button type="button" data-center-action="showMore">Show more</button>
+            <button type="button" data-center-action="close">Close</button>
+          </div>
+          <ol id="${PATCH_ID}-list"></ol>
+          <p class="${PATCH_ID}-note">Safe iPhone Mode uses only page URLs. Advanced Mode may HEAD-check HD guesses or use GM download/clipboard only if those APIs exist.</p>
+        </div>
+      </div>
+    `;
+    controlCenter.addEventListener('click', onControlCenterClick);
+    controlCenter.querySelector(`.${PATCH_ID}-panel`).addEventListener('scroll', onPanelScroll, { passive: true });
+    controlCenter.querySelector(`#${PATCH_ID}-advanced-toggle`).addEventListener('change', toggleAdvancedMode);
+    controlCenter.querySelector(`#${PATCH_ID}-filter-type`).addEventListener('change', (event) => { state.filterType = event.target.value; state.visibleCount = 40; refreshDisplayCandidates(); });
+    controlCenter.querySelector(`#${PATCH_ID}-sort`).addEventListener('change', (event) => { state.sortBy = event.target.value; refreshDisplayCandidates(); });
+    controlCenter.querySelector(`#${PATCH_ID}-hide-dupes`).addEventListener('change', (event) => { state.hideDuplicates = event.target.checked; refreshDisplayCandidates(); });
+    controlCenter.querySelector(`#${PATCH_ID}-large-only`).addEventListener('change', (event) => { state.largeOnly = event.target.checked; state.visibleCount = 40; refreshDisplayCandidates(); });
+    controlCenter.querySelector(`#${PATCH_ID}-verified-only`).addEventListener('change', (event) => { state.verifiedOnly = event.target.checked; state.visibleCount = 40; refreshDisplayCandidates(); });
+    controlCenter.querySelector(`#${PATCH_ID}-likely-only`).addEventListener('change', (event) => { state.likelyOnly = event.target.checked; state.visibleCount = 40; refreshDisplayCandidates(); });
+    controlCenter.querySelector(`#${PATCH_ID}-include-page-links`).addEventListener('change', (event) => { state.includePageLinks = event.target.checked; state.visibleCount = 40; refreshDisplayCandidates(); });
+    document.documentElement.appendChild(controlCenter);
+  }
+
+  function onPanelScroll() {
+    const panel = controlCenter?.querySelector(`.${PATCH_ID}-panel`);
+    if (!panel || panel.scrollTop + panel.clientHeight < panel.scrollHeight - 240) return;
+    if (state.visibleCount < pageCandidates.length) {
+      state.visibleCount += 40;
+      renderControlCenterList(true);
+    }
+  }
+
+  function onControlCenterClick(event) {
+    const action = event.target?.getAttribute?.('data-center-action');
+    const rowButtonUrl = event.target?.getAttribute?.('data-url');
+    const rowAction = event.target?.getAttribute?.('data-row-action');
+
+    if (rowButtonUrl && rowAction) {
+      if (rowAction === 'open') return openNormally(rowButtonUrl);
+      if (rowAction === 'copy') return copyNormally(rowButtonUrl);
+      if (rowAction === 'save') return saveOrOpen(rowButtonUrl);
+      if (rowAction === 'preview') return openFullscreenPreview(rowButtonUrl);
+    }
+
+    if (!action) return;
+    if (action === 'scan') return scanPage(true);
+    if (action === 'selectAll') return selectAllVisible();
+    if (action === 'openSelected') return openSelected();
+    if (action === 'copySelected') return copySelectedUrls();
+    if (action === 'exportText') return exportUrlsAsText();
+    if (action === 'copyAll') return copyAllUrls();
+    if (action === 'showMore') { state.visibleCount += 40; return renderControlCenterList(true); }
+    if (action === 'collapse') return togglePanelCollapse();
+    if (action === 'close') return closeControlCenter();
+  }
+
+  function renderControlCenterList(forceOpen = false) {
+    if (!controlCenter) return;
+    const count = controlCenter.querySelector(`#${PATCH_ID}-count`);
+    const status = controlCenter.querySelector(`#${PATCH_ID}-status`);
+    const list = controlCenter.querySelector(`#${PATCH_ID}-list`);
+    const advancedToggle = controlCenter.querySelector(`#${PATCH_ID}-advanced-toggle`);
+    pageCandidates = getDisplayCandidates();
+    const candidates = pageCandidates.slice(0, state.visibleCount);
+
+    advancedToggle.checked = state.advancedMode;
+    count.textContent = `${pageCandidates.length} shown · ${state.uniqueFound} unique`;
+    status.innerHTML = `
+      <span>Total images found: <strong>${state.totalFound}</strong></span>
+      <span>Unique images found: <strong>${state.uniqueFound}</strong></span>
+      <span>Displayed after filters: <strong>${pageCandidates.length}</strong></span>
+      <span>Selected: <strong>${state.selectedUrls.size}</strong></span>
+      <span>Current mode: <strong>${state.advancedMode ? ADVANCED_MODE : SAFE_MODE}</strong></span>
+      <span>APIs: XHR ${api.xhr ? 'yes' : 'no'} · Download ${api.download ? 'yes' : 'no'} · Clipboard ${api.setClipboard ? 'yes' : 'no'}</span>
+      ${state.isChecking ? '<span>Checking HD guesses…</span>' : ''}
+    `;
+    list.innerHTML = candidates.length ? candidates.map(renderCandidateRow).join('') : '<li>No images found yet. Tap Scan page.</li>';
+    list.hidden = !forceOpen && !candidates.length;
+  }
+
+  function renderCandidateRow(candidate, index) {
+    const checked = state.selectedUrls.has(candidate.url) ? 'checked' : '';
+    const dimensions = dimensionLabel(candidate);
+    const confidenceLabel = CONFIDENCE_LABELS[candidate.confidence || CONFIDENCE.PAGE_LINK] || 'POSSIBLE_IMAGE';
+    const badges = `${candidate.kind === 'guess' ? '<b class="imu-iphone-compat-badge">HD guessed</b>' : ''}${candidate.checked && candidate.ok ? '<b class="imu-iphone-compat-badge imu-iphone-compat-verified">Verified</b>' : ''}<b class="imu-iphone-compat-badge imu-iphone-compat-confidence">${confidenceLabel}</b>`;
+    return `
+      <li class="${PATCH_ID}-result">
+        <label class="${PATCH_ID}-pick"><input type="checkbox" data-select-url="${escapeAttribute(candidate.url)}" ${checked}></label>
+        <button type="button" class="${PATCH_ID}-thumb" data-row-action="preview" data-url="${escapeAttribute(candidate.url)}" aria-label="Open preview"><img src="${escapeAttribute(candidate.thumb || candidate.url)}" alt="" loading="lazy" referrerpolicy="no-referrer"></button>
+        <div class="${PATCH_ID}-meta">
+          <strong>${index + 1}. ${escapeHtml(shortUrl(candidate.url))} ${badges}</strong>
+          <span>Source: ${escapeHtml(candidate.source || 'page URL')} · Type: ${escapeHtml(candidate.mediaType || 'image')} · ${dimensions}</span>
+          <small>${escapeHtml(candidate.url)}</small>
+          <details class="${PATCH_ID}-debug"><summary>Debug score ${Math.round(effectiveScore(candidate))}</summary><small>Matched: ${escapeHtml((candidate.rules || []).join(', ') || 'none')}<br>Reason: ${escapeHtml(candidate.debugReason || 'No debug reason')}<br>Advanced verified: ${candidate.checked && candidate.ok ? 'yes' : 'no'}${candidate.contentLength ? `<br>HEAD content-length: ${candidate.contentLength}` : ''}</small></details>
+          <div class="${PATCH_ID}-row-actions">
+            <button type="button" data-row-action="preview" data-url="${escapeAttribute(candidate.url)}">Fullscreen</button>
+            <button type="button" data-row-action="open" data-url="${escapeAttribute(candidate.url)}">Open</button>
+            <button type="button" data-row-action="copy" data-url="${escapeAttribute(candidate.url)}">Copy</button>
+            <button type="button" data-row-action="save" data-url="${escapeAttribute(candidate.url)}">Save/Open</button>
+          </div>
+        </div>
+      </li>
+    `;
+  }
+
+  function dimensionLabel(candidate) {
+    if (candidate.width && candidate.height) return `${candidate.width}×${candidate.height}`;
+    return `estimated score ${Math.round(effectiveScore(candidate))}`;
+  }
+
+  document.addEventListener('change', (event) => {
+    const url = event.target?.getAttribute?.('data-select-url');
+    if (!url) return;
+    if (event.target.checked) state.selectedUrls.add(url);
+    else state.selectedUrls.delete(url);
+    renderControlCenterList();
+  });
+
+  function selectAllVisible() {
+    ensureScan().forEach((candidate) => state.selectedUrls.add(candidate.url));
+    renderControlCenterList(true);
+    showMessage('Selected all filtered images');
+  }
+
+  function copySelectedUrls() {
+    const urls = ensureScan().filter((candidate) => state.selectedUrls.has(candidate.url)).map((candidate) => candidate.url);
+    if (!urls.length) return showMessage('Select images first.');
+    return copyNormally(urls.join('\n'));
+  }
+
+  function exportUrlsAsText() {
+    const text = ensureScan().map((candidate) => candidate.url).join('\n');
+    if (!text) return showMessage('No image URLs found.');
+    const blob = new Blob([text], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    browserDownloadOrOpen(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 10000);
+  }
+
+  function openFullscreenPreview(url) {
+    ensureFullscreenPreview();
+    fullscreenPreview.querySelector('img').src = url;
+    fullscreenPreview.querySelector('small').textContent = url;
+    fullscreenPreview.hidden = false;
+    fullscreenPreview.classList.add(`${PATCH_ID}-preview-open`);
+  }
+
+  function ensureFullscreenPreview() {
+    if (fullscreenPreview) return;
+    fullscreenPreview = document.createElement('div');
+    fullscreenPreview.id = `${PATCH_ID}-preview`;
+    fullscreenPreview.hidden = true;
+    fullscreenPreview.innerHTML = `
+      <div class="${PATCH_ID}-preview-card">
+        <button type="button" data-preview-close aria-label="Close preview">×</button>
+        <img alt="Fullscreen image preview">
+        <small></small>
+      </div>
+    `;
+    fullscreenPreview.addEventListener('click', (event) => {
+      if (event.target === fullscreenPreview || event.target?.hasAttribute?.('data-preview-close')) closeFullscreenPreview();
+    });
+    fullscreenPreview.addEventListener('touchstart', (event) => { previewTouchStart = event.touches?.[0]?.clientY || null; }, { passive: true });
+    fullscreenPreview.addEventListener('touchend', (event) => {
+      if (previewTouchStart == null) return;
+      const endY = event.changedTouches?.[0]?.clientY || previewTouchStart;
+      if (endY - previewTouchStart > 80) closeFullscreenPreview();
+      previewTouchStart = null;
+    }, { passive: true });
+    document.documentElement.appendChild(fullscreenPreview);
+  }
+
+  function closeFullscreenPreview() {
+    if (!fullscreenPreview) return;
+    fullscreenPreview.classList.remove(`${PATCH_ID}-preview-open`);
+    window.setTimeout(() => { fullscreenPreview.hidden = true; }, 160);
+  }
+
+  function openHelpAbout() {
+    ensureControlCenter();
+    controlCenter.hidden = false;
+    controlCenter.querySelector(`#${PATCH_ID}-count`).textContent = 'Help / About';
+    controlCenter.querySelector(`#${PATCH_ID}-status`).innerHTML = `
+      <span>Current mode: <strong>${state.advancedMode ? ADVANCED_MODE : SAFE_MODE}</strong></span>
+      <span>Use the draggable IMU bubble, filters, sorting, checkboxes, and fullscreen preview without leaving the page.</span>
+      <span>Safe Mode never uses GM_xmlhttpRequest, GM_download, @require, or cross-origin probing.</span>
+      <span>Advanced Mode only uses detected GM APIs and only ranks HD guesses higher after a successful HEAD check.</span>
+    `;
+    const list = controlCenter.querySelector(`#${PATCH_ID}-list`);
+    list.hidden = false;
+    list.innerHTML = `
+      <li>Drag the IMU bubble anywhere comfortable; tap it to open this control center.</li>
+      <li>Use filters for JPG/PNG/WebP, duplicates, and large images; sort by size, filename length, or source confidence.</li>
+      <li>Tap a thumbnail or Fullscreen to preview without leaving the page. Swipe down to close the preview.</li>
+      <li>Select rows, then use Open selected, Copy selected URLs, or Export URLs as text.</li>
+    `;
+  }
+
+  // ---------- Small UI helpers and CSS ----------
+  function showHighlight(element) {
+    if (!highlight) {
+      highlight = document.createElement('div');
+      highlight.id = `${PATCH_ID}-highlight`;
+      document.documentElement.appendChild(highlight);
+    }
+    const rect = element.getBoundingClientRect();
+    Object.assign(highlight.style, {
+      left: `${Math.max(0, rect.left + window.scrollX)}px`,
+      top: `${Math.max(0, rect.top + window.scrollY)}px`,
+      width: `${Math.max(24, rect.width)}px`,
+      height: `${Math.max(24, rect.height)}px`,
+      display: 'block',
+    });
+  }
+
+  function hideUI() {
+    selected = null;
+    if (bar) bar.hidden = true;
+    if (highlight) highlight.style.display = 'none';
+  }
+
+  function showMessage(text) {
+    if (!bar) return;
+    bar.hidden = false;
+    bar.querySelector(`#${PATCH_ID}-title`).textContent = text;
+    window.setTimeout(() => {
+      if (!selected) bar.hidden = true;
+    }, 1800);
+  }
+
+  function shortUrl(url) {
+    try {
+      const parsed = new URL(url);
+      const last = parsed.pathname.split('/').filter(Boolean).pop() || parsed.hostname;
+      return `${parsed.hostname}/${decodeURIComponent(last).slice(0, 56)}`;
+    } catch {
+      return String(url).slice(0, 72);
+    }
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
+
+  function escapeAttribute(value) {
+    return escapeHtml(value).replace(/`/g, '&#096;');
+  }
+
+  function injectStyles() {
+    const style = document.createElement('style');
+    style.textContent = `
+      #${PATCH_ID}-bar {
+        position: fixed !important; z-index: 2147483647 !important;
+        left: max(12px, env(safe-area-inset-left)) !important; right: max(12px, env(safe-area-inset-right)) !important;
+        bottom: max(12px, env(safe-area-inset-bottom)) !important; display: grid !important;
+        grid-template-columns: 1fr auto auto auto auto !important; gap: 8px !important; align-items: center !important;
+        padding: 10px !important; border-radius: 14px !important; background: rgba(17, 24, 39, 0.96) !important;
+        color: #fff !important; box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35) !important;
+        font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+      }
+      #${PATCH_ID}-bar[hidden], #${PATCH_ID}-float[hidden], #${PATCH_ID}-center[hidden] { display: none !important; }
+      #${PATCH_ID}-title { min-width: 0 !important; overflow: hidden !important; text-overflow: ellipsis !important; white-space: nowrap !important; }
+      #${PATCH_ID}-bar button, #${PATCH_ID}-float, #${PATCH_ID}-center button {
+        appearance: none !important; border: 0 !important; border-radius: 999px !important; padding: 9px 12px !important;
+        background: #2563eb !important; color: #fff !important; font: 600 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+      }
+      #${PATCH_ID}-bar button[data-action="download"], #${PATCH_ID}-bar button[data-action="copy"],
+      #${PATCH_ID}-bar button[data-action="center"], #${PATCH_ID}-center button { background: #374151 !important; }
+      #${PATCH_ID}-bar button[data-action="close"], #${PATCH_ID}-center button[data-center-action="close"] { background: #111827 !important; font-size: 18px !important; line-height: 1 !important; }
+      #${PATCH_ID}-float {
+        position: fixed !important; z-index: 2147483646 !important; right: max(12px, env(safe-area-inset-right)) !important;
+        bottom: max(84px, calc(84px + env(safe-area-inset-bottom))) !important; min-width: 54px !important; min-height: 54px !important;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35) !important;
+      }
+      #${PATCH_ID}-center {
+        position: fixed !important; z-index: 2147483647 !important; inset: 0 !important; display: grid !important; place-items: end center !important;
+        padding: 12px max(12px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)) !important;
+        background: rgba(0, 0, 0, 0.35) !important; color: #fff !important; font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+      }
+      #${PATCH_ID}-center .${PATCH_ID}-panel {
+        width: min(760px, 100%) !important; max-height: min(86vh, 760px) !important; overflow: auto !important;
+        border-radius: 18px !important; background: rgba(17, 24, 39, 0.98) !important; box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45) !important; padding: 14px !important;
+      }
+      #${PATCH_ID}-center header { display: flex !important; justify-content: space-between !important; gap: 12px !important; align-items: start !important; margin-bottom: 12px !important; }
+      #${PATCH_ID}-center header strong { display: block !important; font-size: 16px !important; }
+      #${PATCH_ID}-count, #${PATCH_ID}-center .${PATCH_ID}-note, #${PATCH_ID}-status, #${PATCH_ID}-list small { color: #cbd5e1 !important; font-size: 12px !important; }
+      #${PATCH_ID}-status { display: grid !important; grid-template-columns: 1fr 1fr !important; gap: 6px 10px !important; margin: 10px 0 !important; }
+      #${PATCH_ID}-center .${PATCH_ID}-advanced { display: block !important; margin: 10px 0 !important; font-weight: 700 !important; }
+      #${PATCH_ID}-center .${PATCH_ID}-actions { display: grid !important; grid-template-columns: repeat(2, minmax(0, 1fr)) !important; gap: 8px !important; margin-bottom: 12px !important; }
+      #${PATCH_ID}-list { list-style: none !important; margin: 0 !important; padding: 0 !important; }
+      #${PATCH_ID}-list .${PATCH_ID}-result {
+        display: grid !important; grid-template-columns: auto 64px 1fr !important; gap: 10px !important; align-items: start !important;
+        padding: 10px 0 !important; border-top: 1px solid rgba(148, 163, 184, 0.25) !important; color: #e5e7eb !important;
+      }
+      #${PATCH_ID}-list img { width: 64px !important; height: 64px !important; object-fit: cover !important; border-radius: 10px !important; background: #111827 !important; }
+      #${PATCH_ID}-list .${PATCH_ID}-meta { min-width: 0 !important; display: grid !important; gap: 4px !important; }
+      #${PATCH_ID}-list .${PATCH_ID}-meta strong, #${PATCH_ID}-list .${PATCH_ID}-meta small, #${PATCH_ID}-list .${PATCH_ID}-meta span { overflow-wrap: anywhere !important; }
+      #${PATCH_ID}-list .${PATCH_ID}-row-actions { display: flex !important; flex-wrap: wrap !important; gap: 6px !important; margin-top: 4px !important; }
+      #${PATCH_ID}-list .${PATCH_ID}-row-actions button { padding: 7px 10px !important; font-size: 12px !important; }
+      #${PATCH_ID}-list .${PATCH_ID}-pick { padding-top: 20px !important; }
+      #${PATCH_ID}-center {
+        backdrop-filter: blur(12px) !important;
+        -webkit-backdrop-filter: blur(12px) !important;
+        opacity: 0 !important;
+        transition: opacity 180ms ease !important;
+      }
+      #${PATCH_ID}-center.${PATCH_ID}-open { opacity: 1 !important; }
+      #${PATCH_ID}-center.${PATCH_ID}-closing { opacity: 0 !important; }
+      #${PATCH_ID}-center .${PATCH_ID}-panel {
+        transform: translateY(24px) scale(0.98) !important;
+        transition: transform 200ms ease, opacity 200ms ease, max-height 200ms ease !important;
+      }
+      #${PATCH_ID}-center.${PATCH_ID}-open .${PATCH_ID}-panel { transform: translateY(0) scale(1) !important; }
+      #${PATCH_ID}-center.${PATCH_ID}-collapsed .${PATCH_ID}-collapsible { display: none !important; }
+      #${PATCH_ID}-center.${PATCH_ID}-collapsed .${PATCH_ID}-panel { max-height: 92px !important; }
+      #${PATCH_ID}-center .${PATCH_ID}-window-actions { display: flex !important; gap: 8px !important; }
+      #${PATCH_ID}-center .${PATCH_ID}-filters {
+        display: grid !important; grid-template-columns: repeat(2, minmax(0, 1fr)) !important; gap: 8px !important; margin: 10px 0 !important;
+      }
+      #${PATCH_ID}-center select {
+        width: 100% !important; margin-top: 3px !important; border-radius: 10px !important; border: 1px solid rgba(148, 163, 184, 0.4) !important;
+        background: #111827 !important; color: #fff !important; padding: 8px !important;
+      }
+      #${PATCH_ID}-list .${PATCH_ID}-thumb { padding: 0 !important; border-radius: 10px !important; background: transparent !important; }
+      #${PATCH_ID}-list .${PATCH_ID}-badge, .${PATCH_ID}-badge {
+        display: inline-block !important; margin-left: 5px !important; padding: 2px 6px !important; border-radius: 999px !important;
+        background: #7c3aed !important; color: #fff !important; font-size: 11px !important; vertical-align: middle !important;
+      }
+      .${PATCH_ID}-verified { background: #059669 !important; }
+      .${PATCH_ID}-confidence { background: #334155 !important; }
+      #${PATCH_ID}-list .${PATCH_ID}-debug summary { color: #93c5fd !important; font-size: 12px !important; cursor: pointer !important; }
+      #${PATCH_ID}-list .${PATCH_ID}-debug small { display: block !important; margin-top: 4px !important; padding: 6px !important; border-radius: 8px !important; background: rgba(15, 23, 42, 0.8) !important; }
+      #${PATCH_ID}-preview[hidden] { display: none !important; }
+      #${PATCH_ID}-preview {
+        position: fixed !important; z-index: 2147483647 !important; inset: 0 !important; display: grid !important; place-items: center !important;
+        padding: max(16px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)) !important;
+        background: rgba(0, 0, 0, 0.72) !important; backdrop-filter: blur(14px) !important; -webkit-backdrop-filter: blur(14px) !important;
+        opacity: 0 !important; transition: opacity 160ms ease !important;
+      }
+      #${PATCH_ID}-preview.${PATCH_ID}-preview-open { opacity: 1 !important; }
+      #${PATCH_ID}-preview .${PATCH_ID}-preview-card { width: 100% !important; height: 100% !important; display: grid !important; grid-template-rows: auto 1fr auto !important; gap: 8px !important; }
+      #${PATCH_ID}-preview img { max-width: 100% !important; max-height: 100% !important; width: 100% !important; height: 100% !important; object-fit: contain !important; }
+      #${PATCH_ID}-preview small { color: #e5e7eb !important; overflow-wrap: anywhere !important; font-size: 12px !important; }
+      #${PATCH_ID}-preview button { justify-self: end !important; width: 44px !important; height: 44px !important; border-radius: 999px !important; border: 0 !important; background: rgba(17, 24, 39, 0.9) !important; color: #fff !important; font-size: 24px !important; }
+      #${PATCH_ID}-highlight { position: absolute !important; z-index: 2147483646 !important; pointer-events: none !important; border: 3px solid #2563eb !important; border-radius: 8px !important; box-shadow: 0 0 0 9999px rgba(37, 99, 235, 0.10) !important; display: none; }
+      @media (max-width: 430px) {
+        #${PATCH_ID}-bar { grid-template-columns: 1fr auto auto !important; overflow-x: auto !important; }
+        #${PATCH_ID}-status { grid-template-columns: 1fr !important; }
+      }
+    `;
+    document.documentElement.appendChild(style);
+  }
+})();
